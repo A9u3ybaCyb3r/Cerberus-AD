@@ -171,6 +171,40 @@ attack_paths north.sevenkingdoms.local owned \
     --max 5
 ```
 
+## Known memory limitations for very large domains
+
+Beyond the compute-cap fix, two more OOM-relevant issues were found and
+fixed in the opt-in `ADSCAN_ATTACK_PATH_WORKERS` parallel-DFS path (off by
+default, but the thing you'd reach for specifically to speed up a large
+domain): parallel `owned`/principals runs used to ignore the shared
+`max_paths` budget entirely (memory could hit `principal_count × max_paths`)
+and silently dropped `--timeout`/`--exclude-edges`. Both are fixed — see
+`fix: share max_paths budget across parallel-principals workers` in the git
+log. The attack-path result cache also got a third eviction budget bounding
+total records summed across all cache entries, not just entry count, since a
+large domain with many owned principals produces many distinct cache keys
+(see `fix: bound total attack-path cache memory by record count`).
+
+Two remaining costs were investigated and are **not** fixed here, by design:
+
+- **Whole-graph JSON loading.** `load_attack_graph` does one `json.load()`
+  of the full node/edge graph into full property-bag dicts — no streaming or
+  lazy loading. This is an architectural floor of the whole-graph-in-memory
+  model, not a small fix; a real fix means a different on-disk graph format.
+  The existing maintenance-pass skip (persisted across sessions) already
+  avoids redundant O(V+E) work on repeat loads, so there's no cheap win left
+  here.
+- **Parallel worker graph duplication.** Parallel DFS workers
+  (`ADSCAN_ATTACK_PATH_WORKERS`) use Python's `spawn` multiprocessing
+  context intentionally, for PyInstaller/cross-platform compatibility — each
+  worker gets its own pickled copy of the graph via the pool initializer, so
+  peak memory is roughly `(workers + 1) × graph size`. Forcing `fork` to get
+  copy-on-write sharing would risk breaking packaged-binary portability for
+  a code path that's off by default and, per this repo's own measurements,
+  gives no measured speedup on real attack-path graphs anyway. **Leave
+  parallel workers off for large-domain runs** — sequential mode (the
+  default) is the one that's been hardened here.
+
 ## Everything else
 
 `attack_paths <domain> owned` with no new flags still works exactly as
