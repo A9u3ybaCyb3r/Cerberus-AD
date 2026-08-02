@@ -119,10 +119,12 @@ machines.
   package (see "Why this needed its own setup" above). Run tests via
   `uv run pytest -m unit` from the repo root, not a plain `pytest`.
 - **`adscan check`/`start` fails preflight on a missing wordlist or asset**:
-  some build-time-only assets (a combined audit wordlist, a cheatsheet PDF)
-  aren't included in the public GitHub source and have no runtime download
-  path. If you hit one, add a small placeholder file at the expected path
-  (repo-root `wordlists/`, `adscan_internal/assets/cheatsheet/`) so the
-  existence check/COPY passes — the real content isn't needed for
-  attack-path/graph_stats work, only for the specific feature that consumes
-  it (password cracking, the printable cheatsheet).
+  some build-time-only assets aren't included in the public GitHub source
+  and have no runtime download path. Placeholder files at `wordlists/` and
+  `adscan_internal/assets/cheatsheet/Quick_Start_Cheatsheet.pdf` are already
+  committed in this fork so `docker build` passes on a fresh clone — the
+  real content isn't needed for attack-path/graph_stats work, only for the
+  specific feature that consumes it (password cracking, the printable
+  cheatsheet). If a *different* missing asset surfaces later, the same fix
+  applies: add a small placeholder file at the expected path so the
+  existence check/COPY passes.
