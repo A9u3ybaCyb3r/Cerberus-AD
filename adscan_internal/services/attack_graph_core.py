@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import os
 import re
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from collections.abc import Callable, Mapping
@@ -1079,6 +1080,8 @@ def compute_display_paths_for_domain_unfiltered(
     target_mode: str = "object",
     start_node_ids: set[str] | None = None,
     chokepoint_group_ids: set[str] | None = None,
+    deadline: float | None = None,
+    excluded_relations: frozenset[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Compute maximal attack paths for a domain (graph-only, unfiltered).
 
@@ -1117,6 +1120,8 @@ def compute_display_paths_for_domain_unfiltered(
         start_node_ids=effective_start_node_ids,
         reachable_node_ids=high_value_reachable_node_ids,
         chokepoint_group_ids=chokepoint_group_ids,
+        deadline=deadline,
+        excluded_relations=excluded_relations,
     )
 
     results: list[dict[str, Any]] = []
@@ -1802,6 +1807,8 @@ def compute_display_paths_for_start_node(
     max_paths: int | None = None,
     target: str = "highvalue",
     target_mode: str = "object",
+    deadline: float | None = None,
+    excluded_relations: frozenset[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Compute maximal attack paths starting from a specific node id."""
     mode = normalize_target_mode(target_mode)
@@ -1823,6 +1830,8 @@ def compute_display_paths_for_start_node(
         target="all",
         terminal_mode=mode,
         reachable_node_ids=high_value_reachable_node_ids,
+        deadline=deadline,
+        excluded_relations=excluded_relations,
     )
 
     results: list[dict[str, Any]] = []
@@ -3164,8 +3173,29 @@ def compute_maximal_attack_paths(
     start_node_ids: set[str] | None = None,
     reachable_node_ids: set[str] | None = None,
     chokepoint_group_ids: set[str] | None = None,
+    deadline: float | None = None,
+    excluded_relations: frozenset[str] | None = None,
 ) -> list[AttackPath]:
     """Compute maximal paths up to depth for a full-domain graph.
+
+    ``deadline`` (a ``time.monotonic()`` timestamp) is an optional wall-clock
+    budget: once passed, the DFS stops descending and returns whatever paths
+    it already collected instead of running to completion or exhausting
+    memory on a pathologically fan-out-heavy graph. ``None`` (default)
+    preserves the previous unbounded-by-time behavior for every existing
+    caller. Callers that want to know whether a returned result was cut
+    short by the deadline (vs. finishing naturally) can compare
+    ``time.monotonic() >= deadline`` after this returns.
+
+    ``excluded_relations`` (lower-cased relation strings, e.g.
+    ``frozenset({"genericwrite", "addmember"})``) drops matching edges at
+    adjacency-build time, before any DFS ever sees them -- used by
+    ``attack_paths --exclude-edges`` to deprioritize noisy, high-fan-out edge
+    types so search budget isn't wasted fanning out through them. Filtering
+    here (not inside the per-visit edge expansion) means the exclusion
+    applies uniformly to every DFS worker that consumes this adjacency,
+    including the multiprocessing worker path, with no signature changes
+    needed on any hot-path recursive function.
 
     Layer 3 — choke-point-rooted DFS (``chokepoint_group_ids``): the node-ids of
     ``>1``-member ``MemberOf`` target groups (the collapse choke points, computed
@@ -3211,6 +3241,8 @@ def compute_maximal_attack_paths(
         rel = str(edge.get("relation") or "")
         if not from_id or not to_id or not rel:
             continue
+        if excluded_relations and rel.lower() in excluded_relations:
+            continue
         if rel.lower() == "memberof" and (from_id, to_id) in suppressed_memberof:
             continue
         adjacency.setdefault(from_id, []).append(edge)
@@ -3221,10 +3253,14 @@ def compute_maximal_attack_paths(
             incoming[to_id] = incoming.get(to_id, 0) + 1
         incoming.setdefault(from_id, incoming.get(from_id, 0))
         outgoing.setdefault(to_id, outgoing.get(to_id, 0))
-    local_reuse_by_node, local_reuse_existing_pairs = _build_local_reuse_virtual_state(
-        nodes_map, edges
-    )
-    local_reuse_useful_nodes = _build_local_reuse_useful_node_ids(nodes_map, edges)
+    if excluded_relations and _LOCAL_REUSE_RELATION_KEY in excluded_relations:
+        local_reuse_by_node, local_reuse_existing_pairs = {}, set()
+        local_reuse_useful_nodes: set[str] = set()
+    else:
+        local_reuse_by_node, local_reuse_existing_pairs = (
+            _build_local_reuse_virtual_state(nodes_map, edges)
+        )
+        local_reuse_useful_nodes = _build_local_reuse_useful_node_ids(nodes_map, edges)
     implicit_edge_overlay = _build_implicit_path_overlays(graph)
 
     mode = normalize_target_mode(terminal_mode)
@@ -3398,6 +3434,9 @@ def compute_maximal_attack_paths(
     def dfs(current: str, visited: set[str], acc_steps: list[AttackPathStep]) -> None:
         if max_paths_cap is not None and len(paths) >= max_paths_cap:
             return
+        if deadline is not None and time.monotonic() >= deadline:
+            emit(acc_steps)
+            return
         actionable_depth = _count_actionable_edges(acc_steps)
         structural_depth = len(acc_steps) - actionable_depth
         if (
@@ -3520,6 +3559,8 @@ def compute_maximal_attack_paths(
     for source in sources:
         if max_paths_cap is not None and len(paths) >= max_paths_cap:
             break
+        if deadline is not None and time.monotonic() >= deadline:
+            break
         dfs(source, visited={source}, acc_steps=[])
 
     # Then walk each choke-point subtree ONCE, rooted at the group, with the two
@@ -3528,6 +3569,8 @@ def compute_maximal_attack_paths(
     # own source-member set.
     for chokepoint in chokepoint_roots:
         if max_paths_cap is not None and len(paths) >= max_paths_cap:
+            break
+        if deadline is not None and time.monotonic() >= deadline:
             break
         active_guard_members = chokepoint_root_members.get(chokepoint)
         dfs(chokepoint, visited={chokepoint}, acc_steps=[])
@@ -3545,8 +3588,27 @@ def compute_maximal_attack_paths_from_start(
     target: str = "highvalue",
     terminal_mode: str = "domain",
     reachable_node_ids: set[str] | None = None,
+    target_node_id: str | None = None,
+    deadline: float | None = None,
+    excluded_relations: frozenset[str] | None = None,
 ) -> list[AttackPath]:
-    """Compute maximal paths starting from a specific node."""
+    """Compute maximal paths starting from a specific node.
+
+    When ``target_node_id`` is set, paths terminate ONLY at that exact node
+    (used by ``attack_paths --target <name>``'s named-node search) instead
+    of at any node matching ``terminal_mode``'s category, and the ``target``
+    highvalue/lowpriv class filter in ``emit()`` is bypassed accordingly.
+
+    ``deadline`` (a ``time.monotonic()`` timestamp) is an optional wall-clock
+    budget: once passed, the DFS stops descending and returns whatever paths
+    it already collected instead of running to completion. ``None`` (default)
+    preserves the previous unbounded-by-time behavior.
+
+    ``excluded_relations`` (lower-cased relation strings) drops matching
+    edges at adjacency-build time -- see ``compute_maximal_attack_paths``
+    for why this is done here rather than inside the per-visit edge
+    expansion.
+    """
     if max_depth <= 0 or not start_node_id:
         return []
     max_paths_cap = (
@@ -3575,13 +3637,19 @@ def compute_maximal_attack_paths_from_start(
         rel = str(edge.get("relation") or "")
         if not from_id or not to_id or not rel:
             continue
+        if excluded_relations and rel.lower() in excluded_relations:
+            continue
         if rel.lower() == "memberof" and (from_id, to_id) in suppressed_memberof:
             continue
         adjacency.setdefault(from_id, []).append(edge)
-    local_reuse_by_node, local_reuse_existing_pairs = _build_local_reuse_virtual_state(
-        nodes_map, edges
-    )
-    local_reuse_useful_nodes = _build_local_reuse_useful_node_ids(nodes_map, edges)
+    if excluded_relations and _LOCAL_REUSE_RELATION_KEY in excluded_relations:
+        local_reuse_by_node, local_reuse_existing_pairs = {}, set()
+        local_reuse_useful_nodes: set[str] = set()
+    else:
+        local_reuse_by_node, local_reuse_existing_pairs = (
+            _build_local_reuse_virtual_state(nodes_map, edges)
+        )
+        local_reuse_useful_nodes = _build_local_reuse_useful_node_ids(nodes_map, edges)
     implicit_edge_overlay = _build_implicit_path_overlays(graph)
     allowed_reachable_ids: set[str] = (
         {str(node_id) for node_id in reachable_node_ids if str(node_id).strip()}
@@ -3594,6 +3662,8 @@ def compute_maximal_attack_paths_from_start(
     mode = normalize_target_mode(terminal_mode)
 
     def is_terminal(node_id: str) -> bool:
+        if target_node_id is not None:
+            return node_id == target_node_id
         node = nodes_map.get(node_id)
         if not isinstance(node, dict):
             return False
@@ -3611,7 +3681,10 @@ def compute_maximal_attack_paths_from_start(
             return
         if max_paths_cap is not None and len(paths) >= max_paths_cap:
             return
-        if (target == "highvalue" and not is_terminal(acc_steps[-1].to_id)) or (
+        if target_node_id is not None:
+            if acc_steps[-1].to_id != target_node_id:
+                return
+        elif (target == "highvalue" and not is_terminal(acc_steps[-1].to_id)) or (
             target == "lowpriv" and is_terminal(acc_steps[-1].to_id)
         ):
             return
@@ -3629,6 +3702,9 @@ def compute_maximal_attack_paths_from_start(
 
     def dfs(current: str, visited: set[str], acc_steps: list[AttackPathStep]) -> None:
         if max_paths_cap is not None and len(paths) >= max_paths_cap:
+            return
+        if deadline is not None and time.monotonic() >= deadline:
+            emit(acc_steps)
             return
         actionable_depth = _count_actionable_edges(acc_steps)
         structural_depth = len(acc_steps) - actionable_depth
@@ -3711,6 +3787,85 @@ def compute_maximal_attack_paths_from_start(
 
     dfs(start_node_id, visited={start_node_id}, acc_steps=[])
     return paths
+
+
+def compute_paths_to_target(
+    graph: dict[str, Any],
+    *,
+    start_node_ids: list[str],
+    target_node_id: str,
+    max_depth: int,
+    max_paths: int | None = None,
+    deadline: float | None = None,
+    excluded_relations: frozenset[str] | None = None,
+) -> list[AttackPath]:
+    """Shortest-simple-paths-first search from one or more sources to one
+    specific named target node (backs ``attack_paths --target <name>``).
+
+    No k-shortest-paths library exists in this codebase (this engine predates
+    and does not use networkx), so shortest-first ordering comes from
+    iterative deepening instead: this calls
+    :func:`compute_maximal_attack_paths_from_start` at successively larger
+    ``max_depth`` values (1, 2, ..., up to the requested ``max_depth``),
+    stopping as soon as ``max_paths`` results have been collected. Every path
+    found at depth *D* is explored before anything at depth *D+1* is even
+    attempted, so results are naturally shortest-first without needing an
+    explicit k-shortest-paths algorithm -- and each underlying call reuses
+    the exact same adjacency-building, credential-context chaining, and
+    local-reuse-cluster guards as every other DFS entry point in this module,
+    so results stay consistent with what ``attack_paths`` would otherwise
+    consider a valid chain.
+
+    The per-call ``max_paths`` budget is the *remaining* room under the
+    overall cap, so a single depth level with a pathologically fan-out-heavy
+    target can't blow past the requested bound before the cap is checked --
+    unlike a naive "compute everything then truncate" approach.
+    """
+    if max_depth <= 0 or not start_node_ids or not target_node_id:
+        return []
+    max_paths_cap = (
+        None
+        if max_paths is None
+        else max(1, int(max_paths))
+        if int(max_paths) > 0
+        else None
+    )
+
+    collected: list[AttackPath] = []
+    seen_signatures: set[tuple[tuple[str, str, str, str], ...]] = set()
+
+    for depth in range(1, max_depth + 1):
+        if deadline is not None and time.monotonic() >= deadline:
+            return collected
+        for start_node_id in start_node_ids:
+            if not start_node_id or start_node_id == target_node_id:
+                continue
+            if deadline is not None and time.monotonic() >= deadline:
+                return collected
+            remaining: int | None = None
+            if max_paths_cap is not None:
+                remaining = max_paths_cap - len(collected)
+                if remaining <= 0:
+                    return collected
+            candidates = compute_maximal_attack_paths_from_start(
+                graph,
+                start_node_id=start_node_id,
+                max_depth=depth,
+                max_paths=remaining,
+                target="all",
+                target_node_id=target_node_id,
+                deadline=deadline,
+                excluded_relations=excluded_relations,
+            )
+            for path in candidates:
+                signature = tuple(attack_path_step_signature(s) for s in path.steps)
+                if signature in seen_signatures:
+                    continue
+                seen_signatures.add(signature)
+                collected.append(path)
+                if max_paths_cap is not None and len(collected) >= max_paths_cap:
+                    return collected
+    return collected
 
 
 def collect_source_step_signatures_on_high_value_paths(

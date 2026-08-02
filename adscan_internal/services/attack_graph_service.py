@@ -13661,6 +13661,8 @@ def compute_display_paths_for_user(
     no_cache: bool = False,
     allow_owned_terminal_target: bool = False,
     display_friendly: bool | None = None,
+    deadline: float | None = None,
+    excluded_relations: frozenset[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Compute maximal dynamic paths from a specific user node.
 
@@ -13677,8 +13679,13 @@ def compute_display_paths_for_user(
           2) It avoids confusing "self-loop" paths like:
                 jon.snow -> Domain Users -> jon.snow -> ...
              because our DFS only returns simple paths (no repeated nodes).
+
+    ``deadline`` (a ``time.monotonic()`` timestamp, from ``--timeout``) forces
+    a cache bypass on both read and write: a result cut short by the deadline
+    must never be served later, from cache, as if it were a complete result.
     """
     started_at = time.monotonic()
+    _cache_bypass = no_cache or deadline is not None
     effective_depth = _effective_max_depth(max_depth, scope="user", target=target)
     print_info_debug(
         f"[local-pipeline] effective_depth={effective_depth} (requested={max_depth} scope='user' target={target!r})"
@@ -13698,7 +13705,7 @@ def compute_display_paths_for_user(
         ),
     )
     cached = _attack_paths_cache_get(
-        cache_key, domain=domain, scope="user", no_cache=no_cache
+        cache_key, domain=domain, scope="user", no_cache=_cache_bypass
     )
     if cached is not None:
         cached = _filter_zero_length_display_paths(cached, domain=domain, scope="user")
@@ -13803,6 +13810,8 @@ def compute_display_paths_for_user(
                 if materialized_artifacts is not None
                 else None
             ),
+            deadline=deadline,
+            excluded_relations=excluded_relations,
         )
     )
     _dfs_elapsed = time.monotonic() - _dfs_t0
@@ -13848,7 +13857,8 @@ def compute_display_paths_for_user(
         target=target,
         target_mode=target_mode,
     )
-    _attack_paths_cache_put(cache_key, records, domain=domain, scope="user")
+    if not _cache_bypass:
+        _attack_paths_cache_put(cache_key, records, domain=domain, scope="user")
     return records
 
 
@@ -13864,6 +13874,8 @@ def compute_display_paths_for_domain(
     allow_owned_terminal_target: bool = False,
     display_friendly: bool | None = None,
     keep_longest: bool = True,
+    deadline: float | None = None,
+    excluded_relations: frozenset[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Compute maximal attack paths for a domain with optional high-value promotion.
 
@@ -13875,8 +13887,12 @@ def compute_display_paths_for_domain(
     (recursively) of an effectively high-value group. The promotion appends a
     context-only `MemberOf` step so the operator can understand why the path is
     surfaced.
+
+    ``deadline`` forces a cache bypass on both read and write -- see
+    ``compute_display_paths_for_user`` for why.
     """
     started_at = time.monotonic()
+    _cache_bypass = no_cache or deadline is not None
     effective_depth = _effective_max_depth(max_depth, scope="domain", target=target)
     print_info_debug(
         f"[local-pipeline] effective_depth={effective_depth} (requested={max_depth} scope='domain' target={target!r})"
@@ -13898,7 +13914,7 @@ def compute_display_paths_for_domain(
         ),
     )
     cached = _attack_paths_cache_get(
-        cache_key, domain=domain, scope="domain", no_cache=no_cache
+        cache_key, domain=domain, scope="domain", no_cache=_cache_bypass
     )
     if cached is not None:
         cached = _filter_zero_length_display_paths(
@@ -13987,6 +14003,8 @@ def compute_display_paths_for_domain(
                 else None
             ),
             keep_longest=keep_longest,
+            deadline=deadline,
+            excluded_relations=excluded_relations,
         )
     )
     _dfs_elapsed = time.monotonic() - _dfs_t0
@@ -14021,7 +14039,8 @@ def compute_display_paths_for_domain(
         target=target,
         target_mode=target_mode,
     )
-    _attack_paths_cache_put(cache_key, records, domain=domain, scope="domain")
+    if not _cache_bypass:
+        _attack_paths_cache_put(cache_key, records, domain=domain, scope="domain")
     return records
 
 
@@ -14478,6 +14497,8 @@ def compute_display_paths_for_owned_users(
     no_cache: bool = False,
     allow_owned_terminal_target: bool = False,
     display_friendly: bool | None = None,
+    deadline: float | None = None,
+    excluded_relations: frozenset[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Compute maximal dynamic paths for all owned users in a domain.
 
@@ -14489,6 +14510,9 @@ def compute_display_paths_for_owned_users(
         max_depth: Max depth for path search.
         target: When "highvalue", only include paths whose terminal node
             is high value (Tier Zero / highvalue / admin_tier_0).
+        deadline: Optional `time.monotonic()` wall-clock budget (from
+            `--timeout`), shared across every owned principal's search rather
+            than reset per principal.
 
     Returns:
         Deduplicated list of UI-ready path dicts (same shape as `path_to_display_record`).
@@ -14511,6 +14535,8 @@ def compute_display_paths_for_owned_users(
         no_cache=no_cache,
         allow_owned_terminal_target=allow_owned_terminal_target,
         display_friendly=display_friendly,
+        deadline=deadline,
+        excluded_relations=excluded_relations,
     )
 
 
@@ -14707,6 +14733,8 @@ def get_attack_path_summaries(
     render_debug_tables: bool = True,
     display_friendly: bool | None = None,
     keep_longest: bool = True,
+    deadline: float | None = None,
+    excluded_relations: frozenset[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Return user-facing attack-path summaries through the shell-aware layer.
 
@@ -14775,6 +14803,8 @@ def get_attack_path_summaries(
                 no_cache=no_cache,
                 display_friendly=display_friendly,
                 keep_longest=keep_longest,
+                deadline=deadline,
+                excluded_relations=excluded_relations,
             )
     finally:
         attack_graph_core._ATTACK_PATH_WORKERS = _prev_graph_workers  # noqa: SLF001
@@ -15016,8 +15046,16 @@ def _compute_attack_path_summaries_inner(
     no_cache: bool,
     display_friendly: bool | None = None,
     keep_longest: bool = False,
+    deadline: float | None = None,
+    excluded_relations: frozenset[str] | None = None,
 ) -> list[dict[str, Any]]:
-    """Inner implementation of compute_attack_path_summaries, engine-dispatched."""
+    """Inner implementation of compute_attack_path_summaries, engine-dispatched.
+
+    ``deadline`` only applies to the local DFS engine (``engine == "local"``);
+    the rustworkx benchmark path is dev-only and unused in production (see
+    ``_ask_or_get_attack_path_engine``), so it's intentionally not threaded
+    there.
+    """
     allow_owned_terminal_target = bool(
         isinstance(summary_filters, AttackPathSummaryFilters)
         and summary_filters.target_labels
@@ -15054,6 +15092,8 @@ def _compute_attack_path_summaries_inner(
             allow_owned_terminal_target=allow_owned_terminal_target,
             display_friendly=display_friendly,
             keep_longest=keep_longest,
+            deadline=deadline,
+            excluded_relations=excluded_relations,
         )
     elif scope_norm == "user":
         if not str(username or "").strip():
@@ -15069,6 +15109,8 @@ def _compute_attack_path_summaries_inner(
             no_cache=no_cache,
             allow_owned_terminal_target=allow_owned_terminal_target,
             display_friendly=display_friendly,
+            deadline=deadline,
+            excluded_relations=excluded_relations,
         )
     elif scope_norm == "owned":
         local_result = compute_display_paths_for_owned_users(
@@ -15081,6 +15123,8 @@ def _compute_attack_path_summaries_inner(
             no_cache=no_cache,
             allow_owned_terminal_target=allow_owned_terminal_target,
             display_friendly=display_friendly,
+            deadline=deadline,
+            excluded_relations=excluded_relations,
         )
     elif scope_norm == "principals":
         normalized_principals = [
@@ -15102,6 +15146,8 @@ def _compute_attack_path_summaries_inner(
             no_cache=no_cache,
             allow_owned_terminal_target=allow_owned_terminal_target,
             display_friendly=display_friendly,
+            deadline=deadline,
+            excluded_relations=excluded_relations,
         )
     else:
         raise ValueError(f"Unsupported attack path summary scope: {scope_norm!r}")
@@ -15200,13 +15246,19 @@ def compute_display_paths_for_principals(
     no_cache: bool = False,
     allow_owned_terminal_target: bool = False,
     display_friendly: bool | None = None,
+    deadline: float | None = None,
+    excluded_relations: frozenset[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Compute maximal dynamic paths for a list of user principals.
 
     This is used to implement `attack_paths <domain> owned` without spamming one
     identical membership-originating path per owned user.
+
+    ``deadline`` forces a cache bypass on both read and write -- see
+    ``compute_display_paths_for_user`` for why.
     """
     started_at = time.monotonic()
+    _cache_bypass = no_cache or deadline is not None
     effective_depth = _effective_max_depth(max_depth, scope="principals", target=target)
     print_info_debug(
         f"[local-pipeline] effective_depth={effective_depth} (requested={max_depth} scope='principals' target={target!r})"
@@ -15241,7 +15293,7 @@ def compute_display_paths_for_principals(
         ),
     )
     cached = _attack_paths_cache_get(
-        cache_key, domain=domain, scope="principals", no_cache=no_cache
+        cache_key, domain=domain, scope="principals", no_cache=_cache_bypass
     )
     if cached is not None:
         cached = _filter_zero_length_display_paths(
@@ -15387,6 +15439,8 @@ def compute_display_paths_for_principals(
             membership_sample_max=membership_sample_max,
             target_mode=target_mode,
             filter_shortest_paths=False,
+            deadline=deadline,
+            excluded_relations=excluded_relations,
         )
     )
     _dfs_elapsed = time.monotonic() - _dfs_t0
@@ -15423,7 +15477,8 @@ def compute_display_paths_for_principals(
         target=target,
         target_mode=target_mode,
     )
-    _attack_paths_cache_put(cache_key, records, domain=domain, scope="principals")
+    if not _cache_bypass:
+        _attack_paths_cache_put(cache_key, records, domain=domain, scope="principals")
     return records
 
 

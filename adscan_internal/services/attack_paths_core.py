@@ -2638,6 +2638,8 @@ def compute_display_paths_for_domain(
     start_node_ids: set[str] | None = None,
     materialized_artifacts: dict[str, Any] | None = None,
     keep_longest: bool = True,
+    deadline: float | None = None,
+    excluded_relations: frozenset[str] | None = None,
 ) -> list[dict[str, Any]]:
     pipeline_started_at = time.monotonic()
     runtime_graph: dict[str, Any] = dict(graph)
@@ -2711,6 +2713,8 @@ def compute_display_paths_for_domain(
         target_mode=mode,
         start_node_ids=start_node_ids,
         chokepoint_group_ids=chokepoint_group_ids,
+        deadline=deadline,
+        excluded_relations=excluded_relations,
     )
     _log_phase_timing(
         scope="domain",
@@ -2805,6 +2809,8 @@ def compute_display_paths_for_start_node(
     expand_terminal_memberships: bool = True,
     filter_shortest_paths: bool = True,
     materialized_artifacts: dict[str, Any] | None = None,
+    deadline: float | None = None,
+    excluded_relations: frozenset[str] | None = None,
 ) -> list[dict[str, Any]]:
     pipeline_started_at = time.monotonic()
     runtime_graph: dict[str, Any] = dict(graph)
@@ -2912,6 +2918,8 @@ def compute_display_paths_for_start_node(
         max_paths=max_paths,
         target=target,
         target_mode=mode,
+        deadline=deadline,
+        excluded_relations=excluded_relations,
     )
     _log_phase_timing(
         scope="start_node",
@@ -2993,6 +3001,8 @@ def compute_display_paths_for_user(
     target_mode: str = "object",
     filter_shortest_paths: bool = True,
     materialized_artifacts: dict[str, Any] | None = None,
+    deadline: float | None = None,
+    excluded_relations: frozenset[str] | None = None,
 ) -> list[dict[str, Any]]:
     start_node_id = _find_node_id_by_label(graph, username)
     if not start_node_id:
@@ -3008,6 +3018,8 @@ def compute_display_paths_for_user(
         target_mode=target_mode,
         filter_shortest_paths=filter_shortest_paths,
         materialized_artifacts=materialized_artifacts,
+        deadline=deadline,
+        excluded_relations=excluded_relations,
     )
 
 
@@ -3023,6 +3035,8 @@ def compute_display_paths_for_principals(
     membership_sample_max: int = 3,
     target_mode: str = "object",
     filter_shortest_paths: bool = True,
+    deadline: float | None = None,
+    excluded_relations: frozenset[str] | None = None,
 ) -> list[dict[str, Any]]:
     pipeline_started_at = time.monotonic()
     normalized_principals = [str(p or "").strip().lower() for p in principals]
@@ -3087,6 +3101,11 @@ def compute_display_paths_for_principals(
     if n_workers < 2:
         # --- Sequential DFS (default / fallback) ----------------------------
         for username in normalized_principals:
+            if deadline is not None and time.monotonic() >= deadline:
+                # Budget is shared across the whole owned/principals sweep, not
+                # reset per principal -- once it's gone, stop starting new DFS
+                # runs and return whatever was already collected.
+                break
             remaining = None
             if isinstance(max_paths, int) and max_paths > 0:
                 remaining = max_paths - len(all_records)
@@ -3102,6 +3121,8 @@ def compute_display_paths_for_principals(
                 target=target,
                 target_mode=target_mode,
                 filter_shortest_paths=filter_shortest_paths,
+                deadline=deadline,
+                excluded_relations=excluded_relations,
             )
             all_records.extend(records)
 

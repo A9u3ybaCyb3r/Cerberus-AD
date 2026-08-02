@@ -27091,7 +27091,7 @@ class PentestShell:
         only paths to non-high-value targets (pivot opportunities, lateral movement).
 
         Usage:
-            attack_paths <domain>   [--max N] [--depth N] [--path-steps N] [--all] [--lowpriv] [--keep-longest]
+            attack_paths <domain>   [--max N] [--depth N] [--path-steps N] [--all] [--lowpriv] [--keep-longest] [--target NAME] [--timeout N] [--exclude-edges REL1,REL2]
 
         Args:
             domain: Target domain (e.g. `north.sevenkingdoms.local`)
@@ -27112,6 +27112,24 @@ class PentestShell:
                 holistic kill chain by default (all distinct entry points, with the
                 broadest-reach and PROVEN paths preserved). This opt-out reverts to the
                 legacy most-direct-route view. (--keep-longest is retained as a no-op.)
+            --target NAME: Search for shortest path(s) to one specific named node
+                (e.g. `--target "Domain Admins"`) instead of any high-value/Tier-0
+                target. Combine with `owned`/a username/no positional the same way
+                as any other scope. Results are shortest-first and bounded by --max.
+            --timeout N: Wall-clock budget in seconds for the whole computation
+                (shared across the entire owned/principals/domain sweep, not reset
+                per principal). Returns whatever paths were found before the
+                deadline instead of running to completion or risking an OOM on a
+                pathologically fan-out-heavy graph -- pair with `graph_stats` to
+                pick a sane value up front. Bypasses the path cache: a
+                --timeout-truncated result is never served later as if complete.
+            --exclude-edges REL1,REL2: Drop matching relation types (e.g.
+                `GenericWrite`, `AddMember`, case-insensitive, comma-separated)
+                from traversal entirely, before the DFS ever sees them. Use this
+                to deprioritize noisy, high-fan-out edges (often lab
+                noise-generation tooling, per `graph_stats`) so search budget
+                isn't wasted fanning out through them before reaching paths
+                that actually matter.
 
         Examples:
             attack_paths north.sevenkingdoms.local
@@ -27120,6 +27138,9 @@ class PentestShell:
             attack_paths north.sevenkingdoms.local --lowpriv
             attack_paths north.sevenkingdoms.local --keep-longest
             attack_paths north.sevenkingdoms.local --max 20 --depth 6
+            attack_paths north.sevenkingdoms.local owned --target "Domain Admins"
+            attack_paths north.sevenkingdoms.local owned --timeout 60
+            attack_paths north.sevenkingdoms.local owned --exclude-edges GenericWrite,AddMember
             attack_paths north.sevenkingdoms.local --path-steps 2
             attack_paths north.sevenkingdoms.local jon.snow
             attack_paths north.sevenkingdoms.local jon.snow 1
@@ -27137,9 +27158,44 @@ class PentestShell:
         if not domain:
             print_instruction(
                 "Usage: attack_paths <domain> [user|owned|user1 user2 ...] [index] [--max N] [--depth N] "
-                "[--path-steps N] [--tier0-only] [--all] [--lowpriv] [--no-cache] [--keep-longest]"
+                "[--path-steps N] [--tier0-only] [--all] [--lowpriv] [--no-cache] [--keep-longest] "
+                "[--target NAME] [--timeout N] [--exclude-edges REL1,REL2]"
             )
             return
+
+        def _parse_exclude_edges(raw: str) -> frozenset[str] | None:
+            names = {n.strip() for n in raw.split(",") if n.strip()}
+            if not names:
+                return None
+            from adscan_internal.services.edge_kind import (
+                _AUTH_EDGES,
+                _CONTROL_EDGES,
+                _DERIVED_EDGES,
+                _ESCALATION_EDGES,
+                _MEMBERSHIP_EDGES,
+                _TRUST_EDGES,
+            )
+
+            known_lower = {
+                r.lower()
+                for r in (
+                    _CONTROL_EDGES
+                    | _AUTH_EDGES
+                    | _MEMBERSHIP_EDGES
+                    | _TRUST_EDGES
+                    | _DERIVED_EDGES
+                    | _ESCALATION_EDGES
+                )
+            }
+            unrecognized = {n for n in names if n.lower() not in known_lower}
+            if unrecognized:
+                print_warning(
+                    "--exclude-edges: unrecognized relation name(s) "
+                    f"{sorted(unrecognized)} -- excluding them anyway in case "
+                    "they're a custom/derived relation not yet cataloged, but "
+                    "double-check spelling."
+                )
+            return frozenset(n.lower() for n in names)
 
         index: int | None = None
         start_user: str | None = None
@@ -27151,6 +27207,9 @@ class PentestShell:
         target_mode = "object"
         no_cache = False
         keep_longest = True
+        target_name: str | None = None
+        timeout_seconds: float | None = None
+        excluded_relations: frozenset[str] | None = None
 
         # Parse flags first: --max N, --depth N (and remove them from positional parsing).
         positionals: list[str] = []
@@ -27232,6 +27291,45 @@ class PentestShell:
                 keep_longest = False
                 i += 1
                 continue
+            if token == "--target" and i + 1 < len(parts):
+                # Greedily consume tokens up to the next --flag so multi-word
+                # names (e.g. `--target Domain Admins`) don't need quoting --
+                # args.split() is whitespace-naive and would otherwise strand
+                # quote characters as literal text rather than a boundary.
+                j = i + 1
+                target_tokens: list[str] = []
+                while j < len(parts) and not parts[j].startswith("--"):
+                    target_tokens.append(parts[j])
+                    j += 1
+                target_name = " ".join(target_tokens).strip("\"'") or None
+                i = j
+                continue
+            if token.startswith("--target="):
+                target_name = token.split("=", 1)[1].strip("\"'") or None
+                i += 1
+                continue
+            if token == "--timeout" and i + 1 < len(parts):
+                try:
+                    timeout_seconds = float(parts[i + 1])
+                except ValueError:
+                    pass
+                i += 2
+                continue
+            if token.startswith("--timeout="):
+                try:
+                    timeout_seconds = float(token.split("=", 1)[1])
+                except ValueError:
+                    pass
+                i += 1
+                continue
+            if token == "--exclude-edges" and i + 1 < len(parts):
+                excluded_relations = _parse_exclude_edges(parts[i + 1])
+                i += 2
+                continue
+            if token.startswith("--exclude-edges="):
+                excluded_relations = _parse_exclude_edges(token.split("=", 1)[1])
+                i += 1
+                continue
             positionals.append(token)
             i += 1
 
@@ -27276,6 +27374,9 @@ class PentestShell:
             allow_execution=True,
             no_cache=no_cache,
             keep_longest=keep_longest,
+            target_name=target_name,
+            timeout_seconds=timeout_seconds,
+            excluded_relations=excluded_relations,
         )
 
     def do_attack_steps(self, args):

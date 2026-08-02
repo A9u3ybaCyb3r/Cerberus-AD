@@ -10,6 +10,7 @@ from collections import defaultdict
 import os
 import sys
 import re
+import time
 from datetime import datetime, timezone
 
 from rich.prompt import Confirm, Prompt
@@ -1840,12 +1841,36 @@ def run_show_attack_paths(
     max_path_steps: int | None = None,
     no_cache: bool = False,
     keep_longest: bool = False,
+    target_name: str | None = None,
+    timeout_seconds: float | None = None,
+    excluded_relations: frozenset[str] | None = None,
 ) -> None:
     """Show attack paths and optionally a detailed path.
 
     ``keep_longest`` only affects the ``domain`` scope (no explicit start user /
     ``owned``): when False (default) the listing shows the most direct route to
     domain compromise; when True it shows the holistic longest kill chain.
+
+    ``target_name`` switches to a shortest-simple-paths-first search toward one
+    specific named node (e.g. ``"Domain Admins"``) instead of the normal
+    category-based ``target``/``target_mode`` search — see
+    :func:`adscan_internal.services.attack_graph_core.compute_paths_to_target`.
+    Source selection (owned / explicit user(s)) still follows ``start_user``/
+    ``start_users`` the same way it does for every other scope.
+
+    ``timeout_seconds`` bounds the whole compute call by wall-clock time: the
+    absolute deadline is derived once (not re-derived per principal, so the
+    budget is shared across the whole ``owned`` sweep) and threaded down to
+    every DFS entry point, which returns whatever paths it already collected
+    once the deadline passes instead of running to completion. Forces a cache
+    bypass (a partial result must never be served later as if complete).
+
+    ``excluded_relations`` (case-insensitive relation names, e.g.
+    ``{"GenericWrite", "AddMember"}``) drops matching edges from traversal
+    entirely, before the DFS ever sees them -- for deprioritizing noisy,
+    high-fan-out edge types (often lab noise-generation tooling) so search
+    budget isn't wasted fanning out through them before reaching paths that
+    actually matter.
     """
     from adscan_internal.services.attack_graph_service import (
         get_attack_paths_cache_stats,
@@ -2260,6 +2285,10 @@ def run_show_attack_paths(
         owned_norm=_owned_norm,
     )
     max_paths_compute = _resolve_attack_paths_compute_cap(max_display)
+    # Derived ONCE here, not re-derived per principal/scope call, so the
+    # budget is shared across the whole compute (e.g. the entire `owned`
+    # sweep), not reset for every principal it walks.
+    deadline = time.monotonic() + timeout_seconds if timeout_seconds else None
 
     def _sort_paths(paths: list[dict[str, Any]]) -> list[dict[str, Any]]:
         # Canonical UX ordering — same single source of truth used by the
@@ -2271,7 +2300,62 @@ def run_show_attack_paths(
 
         return order_attack_paths_for_display(paths)
 
+    def _compute_target_paths() -> list[dict[str, Any]]:
+        from adscan_internal.services.attack_graph_core import (
+            compute_paths_to_target,
+            path_to_display_record,
+        )
+        from adscan_internal.services.attack_paths_core import _find_node_id_by_label
+
+        graph = load_attack_graph(shell, target_domain)
+        target_node_id = _find_node_id_by_label(graph, target_name or "")
+        if not target_node_id:
+            print_warning(f"No node found matching --target '{target_name}'.")
+            return []
+
+        if start_user_norm == "owned":
+            source_labels = get_owned_domain_usernames_for_attack_paths(
+                shell, target_domain
+            )
+        elif start_users and len(start_users) > 1:
+            source_labels = start_users
+        elif start_user:
+            source_labels = [start_user]
+        else:
+            source_labels = get_owned_domain_usernames_for_attack_paths(
+                shell, target_domain
+            )
+
+        source_ids: list[str] = []
+        for label in source_labels:
+            node_id = _find_node_id_by_label(graph, label)
+            if node_id:
+                source_ids.append(node_id)
+        if not source_ids:
+            marked_domain = mark_sensitive(target_domain, "domain")
+            print_warning(
+                f"No resolvable source principals found for {marked_domain}."
+            )
+            return []
+
+        target_paths = compute_paths_to_target(
+            graph,
+            start_node_ids=source_ids,
+            target_node_id=target_node_id,
+            max_depth=max_depth,
+            max_paths=max_paths_compute,
+            deadline=deadline,
+            excluded_relations=excluded_relations,
+        )
+        # Deliberately NOT run through _sort_paths: compute_paths_to_target's
+        # whole contract is shortest-simple-paths-first, and the priority-class
+        # regroup order_attack_paths_for_display applies for the normal scopes
+        # would undo that ordering guarantee.
+        return [path_to_display_record(graph, p) for p in target_paths]
+
     def _compute_paths() -> list[dict[str, Any]]:
+        if target_name:
+            return _compute_target_paths()
         if start_user_norm == "owned":
             owned_users = get_owned_domain_usernames_for_attack_paths(
                 shell, target_domain
@@ -2292,6 +2376,8 @@ def run_show_attack_paths(
                 target_mode=target_mode,
                 display_friendly=display_friendly,
                 no_cache=no_cache,
+                deadline=deadline,
+                excluded_relations=excluded_relations,
             )
             if not owned_paths:
                 marked_domain = mark_sensitive(target_domain, "domain")
@@ -2318,6 +2404,8 @@ def run_show_attack_paths(
                 target_mode=target_mode,
                 display_friendly=display_friendly,
                 no_cache=no_cache,
+                deadline=deadline,
+                excluded_relations=excluded_relations,
             )
             if not principal_paths:
                 marked_users = ", ".join(mark_sensitive(u, "user") for u in start_users)
@@ -2335,6 +2423,8 @@ def run_show_attack_paths(
                 target_mode=target_mode,
                 display_friendly=display_friendly,
                 no_cache=no_cache,
+                deadline=deadline,
+                excluded_relations=excluded_relations,
             )
             return _sort_paths(user_paths)
         domain_paths = get_attack_path_summaries(
@@ -2348,10 +2438,25 @@ def run_show_attack_paths(
             display_friendly=display_friendly,
             no_cache=no_cache,
             keep_longest=keep_longest,
+            deadline=deadline,
+            excluded_relations=excluded_relations,
         )
         return _sort_paths(domain_paths)
 
     path_refs = _compute_paths()
+    if deadline is not None and time.monotonic() >= deadline:
+        # Comparing "now" against the deadline post-hoc (rather than plumbing
+        # an explicit timed-out flag back up through every DFS return value,
+        # which would require changing list[AttackPath] to a tuple return
+        # everywhere it's used) is a deliberate, low-risk approximation: it
+        # can only under-report a timeout that landed in the last few
+        # microseconds of post-processing, never over-report one.
+        print_warning(
+            f"attack_paths: stopped after {timeout_seconds:.0f}s timeout -- "
+            f"showing {len(path_refs)} path(s) found before the deadline. "
+            "This may be a partial result; re-run with a longer --timeout, a "
+            "narrower --depth/--target, or --exclude-edges for a complete search."
+        )
     cache_after = get_attack_paths_cache_stats(domain=target_domain)
     membership_cache_after = get_membership_snapshot_cache_stats()
 
