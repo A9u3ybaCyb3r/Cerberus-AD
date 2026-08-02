@@ -210,33 +210,65 @@ def _record_exact_signature(
     return signature
 
 
+def _next_remaining_budget(
+    max_paths: int | None, produced_so_far: int
+) -> tuple[int | None, bool]:
+    """Return ``(remaining_cap, should_stop)`` for the next unit of principal DFS work.
+
+    Single source of truth for the shared ``max_paths`` budget so the
+    sequential loop and the parallel wave loop can't independently drift out
+    of sync again -- that drift (parallel mode silently ignoring the shared
+    budget) was the root cause of an owned-scope OOM vector on large domains.
+    """
+    if not (isinstance(max_paths, int) and max_paths > 0):
+        return None, False
+    remaining = max_paths - produced_so_far
+    if remaining <= 0:
+        return None, True
+    return remaining, False
+
+
+def _principal_batches(principals: list[str], batch_size: int) -> list[list[str]]:
+    """Split *principals* into fixed-size dispatch waves (pure, no I/O)."""
+    size = max(1, batch_size)
+    return [principals[i : i + size] for i in range(0, len(principals), size)]
+
+
 def _principal_worker_init(
     graph: dict[str, Any],
     domain: str,
     snapshot: dict[str, Any] | None,
     max_depth: int,
-    max_paths: int | None,
     target: str,
     target_mode: str,
     filter_shortest_paths: bool,
+    deadline: float | None,
+    excluded_relations: frozenset[str] | None,
 ) -> None:
     """Populate per-worker globals. Called once per worker process by the pool initializer."""
     global _PW_GRAPH, _PW_DOMAIN, _PW_SNAPSHOT  # noqa: PLW0603
-    global _PW_MAX_DEPTH, _PW_MAX_PATHS, _PW_TARGET, _PW_TARGET_MODE, _PW_FILTER_SHORTEST  # noqa: PLW0603
+    global _PW_MAX_DEPTH, _PW_TARGET, _PW_TARGET_MODE, _PW_FILTER_SHORTEST  # noqa: PLW0603
+    global _PW_DEADLINE, _PW_EXCLUDED_RELATIONS  # noqa: PLW0603
     _PW_GRAPH = graph
     _PW_DOMAIN = domain
     _PW_SNAPSHOT = snapshot
     _PW_MAX_DEPTH = max_depth
-    _PW_MAX_PATHS = max_paths
     _PW_TARGET = target
     _PW_TARGET_MODE = target_mode
     _PW_FILTER_SHORTEST = filter_shortest_paths
+    _PW_DEADLINE = deadline
+    _PW_EXCLUDED_RELATIONS = excluded_relations
 
 
-def _compute_paths_for_principal_worker(username: str) -> list[dict[str, Any]]:
+def _compute_paths_for_principal_worker(
+    username: str, max_paths_override: int | None
+) -> list[dict[str, Any]]:
     """Compute attack paths for one principal using per-worker state.
 
-    Module-level so it is picklable for multiprocessing dispatch.
+    ``max_paths_override`` is passed per-task (not fixed at pool creation) so
+    the shared budget computed by ``_next_remaining_budget`` for the current
+    wave is honored. Module-level so it is picklable for multiprocessing
+    dispatch.
     """
     return compute_display_paths_for_user(
         _PW_GRAPH,
@@ -244,10 +276,12 @@ def _compute_paths_for_principal_worker(username: str) -> list[dict[str, Any]]:
         snapshot=_PW_SNAPSHOT,
         username=username,
         max_depth=_PW_MAX_DEPTH,
-        max_paths=_PW_MAX_PATHS,
+        max_paths=max_paths_override,
         target=_PW_TARGET,
         target_mode=_PW_TARGET_MODE,
         filter_shortest_paths=_PW_FILTER_SHORTEST,
+        deadline=_PW_DEADLINE,
+        excluded_relations=_PW_EXCLUDED_RELATIONS,
     )
 
 
@@ -276,11 +310,17 @@ def _run_parallel_principals(
     target_mode: str,
     filter_shortest_paths: bool,
     n_workers: int,
+    deadline: float | None = None,
+    excluded_relations: frozenset[str] | None = None,
 ) -> list[dict[str, Any]] | None:
     """Run per-principal DFS in parallel with spawn-context workers.
 
     The graph and snapshot are sent to each worker once via the pool
-    initializer.  Each task only carries the principal username string.
+    initializer.  Principals are dispatched in fixed-size waves (not all at
+    once) so the shared ``max_paths`` budget -- recomputed via
+    ``_next_remaining_budget`` between waves -- and ``deadline`` are honored
+    the same way the sequential path honors them, instead of every worker
+    independently computing up to the full ``max_paths`` per principal.
 
     Returns the aggregated list of raw records on success, or None on any
     error (caller should fall back to sequential).
@@ -301,19 +341,30 @@ def _run_parallel_principals(
                 domain,
                 snapshot,
                 max_depth,
-                max_paths,
                 target,
                 target_mode,
                 filter_shortest_paths,
+                deadline,
+                excluded_relations,
             ),
         ) as pool:
-            futures = {
-                pool.submit(_compute_paths_for_principal_worker, u): u
-                for u in principals
-            }
-            for future in concurrent.futures.as_completed(futures):
-                records = future.result()
-                all_records.extend(records)
+            for batch in _principal_batches(principals, n_workers):
+                if deadline is not None and time.monotonic() >= deadline:
+                    break
+                remaining, should_stop = _next_remaining_budget(
+                    max_paths, len(all_records)
+                )
+                if should_stop:
+                    break
+                futures = {
+                    pool.submit(
+                        _compute_paths_for_principal_worker, u, remaining
+                    ): u
+                    for u in batch
+                }
+                for future in concurrent.futures.as_completed(futures):
+                    records = future.result()
+                    all_records.extend(records)
     except Exception:  # noqa: BLE001
         return None
 
@@ -3068,10 +3119,11 @@ def compute_display_paths_for_principals(
 
     # --- Parallel principals DFS ---------------------------------------------
     # When ADSCAN_ATTACK_PATH_WORKERS != 0 and there are enough principals,
-    # dispatch each principal's DFS to a separate worker process.  The graph
-    # and snapshot are sent via the pool initializer (once per worker).
-    # max_paths budget is not enforced per-principal in parallel mode (the
-    # global cap is approximate); the post-processing pipeline handles it.
+    # dispatch principals to worker processes in fixed-size waves (not all at
+    # once).  The graph and snapshot are sent via the pool initializer (once
+    # per worker); the shared max_paths budget and deadline are recomputed
+    # between waves via _next_remaining_budget, mirroring the sequential loop
+    # below so the two paths can't drift out of sync.
     all_records: list[dict[str, Any]] = []
     n_workers = _effective_principal_workers(len(normalized_principals))
     if n_workers >= 2:
@@ -3089,6 +3141,8 @@ def compute_display_paths_for_principals(
             target_mode,
             filter_shortest_paths,
             n_workers,
+            deadline=deadline,
+            excluded_relations=excluded_relations,
         )
         if parallel_result is not None:
             all_records = parallel_result
@@ -3106,11 +3160,11 @@ def compute_display_paths_for_principals(
                 # reset per principal -- once it's gone, stop starting new DFS
                 # runs and return whatever was already collected.
                 break
-            remaining = None
-            if isinstance(max_paths, int) and max_paths > 0:
-                remaining = max_paths - len(all_records)
-                if remaining <= 0:
-                    break
+            remaining, should_stop = _next_remaining_budget(
+                max_paths, len(all_records)
+            )
+            if should_stop:
+                break
             records = compute_display_paths_for_user(
                 graph,
                 domain=domain,
