@@ -21,7 +21,7 @@ separation is set up and how to rebuild after making further changes.
 non-trivial graphs — the compute-time path cap is unbounded by default, so
 nothing stops a fully unbounded DFS from running per owned principal until
 the kernel intervenes. This fork fixes that (see `fix: bound attack-path
-compute cap by default` in the git log) and adds four new capabilities on
+compute cap by default` in the git log) and adds several new capabilities on
 top of the fix:
 
 | Addition | What it does |
@@ -30,6 +30,8 @@ top of the fix:
 | `attack_paths ... --target <name>` | Shortest path(s) to one specific node |
 | `attack_paths ... --timeout <seconds>` | Wall-clock budget with partial results |
 | `attack_paths ... --exclude-edges <rel1,rel2>` | Drop noisy edge types from traversal |
+| `attack_paths ... --easy-first` | Sort by "what can I actually go do now," not target importance |
+| *(automatic)* | Attack-path results persist to disk, reused across separate command runs |
 
 ## Recommended workflow for an unfamiliar or large domain
 
@@ -160,14 +162,59 @@ attack_paths north.sevenkingdoms.local owned --exclude-edges genericwrite --targ
 Unrecognized relation names get a warning (not an error — a graph can
 legitimately contain custom/derived relations) and are still excluded.
 
+## `attack_paths ... --easy-first`
+
+Re-sorts results toward what you can practically go do right now, instead of
+the default ordering (target importance first: Tier 0 > high-value > pivot,
+*then* path length/effort as a late tiebreaker). Concretely:
+
+1. Paths starting from a credential you already own, first.
+2. Then the shortest path (fewest hops).
+3. Then the lowest aggregate technique-effort score.
+4. Falls back to the normal target-importance tiering only as a final
+   tiebreak, so a genuinely critical target still doesn't get buried.
+
+This matters because the default ordering can bury a one-hop path you can
+execute *right now* (e.g. ADCS ESC1 — tagged "high effort" in the shared
+catalog even though it's often one of the most reliable real-world
+techniques) behind a longer, harder multi-hop chain to a target the tool
+considers nominally more important.
+
+```
+attack_paths north.sevenkingdoms.local owned --easy-first
+attack_paths north.sevenkingdoms.local jon.snow --easy-first --max 5
+```
+
+Doesn't change what's found, only the order — combine freely with `--target`,
+`--timeout`, `--exclude-edges`, `--max`.
+
+## Attack-path results now persist to disk automatically
+
+Previously, computed attack-path results were cached only in memory for the
+life of one process. That's close to useless for `cerberus-ad execute
+attack_paths ...` (a fresh process every call) or a `ci` re-run — every
+invocation recomputed from scratch, no matter how expensive. Results are now
+also written to `domains/<domain>/.attack_paths_cache/results/` inside the
+workspace, keyed the same way the in-memory cache already is (bound to the
+graph and membership-snapshot file's mtime, so a changed graph never serves a
+stale disk result). No flag needed — this is on by default. Verified live:
+a repeat call against a real collected graph was ~7x faster on the second
+(disk-served) run.
+
+Tuning (rarely needed):
+- `ADSCAN_ATTACK_PATHS_DISK_CACHE_ENABLED=0` — disable entirely.
+- `ADSCAN_ATTACK_PATHS_DISK_CACHE_MAX_FILES=<N>` — how many distinct result
+  sets to keep per domain before pruning the oldest (default 200).
+
 ## Combining flags
 
-All four are independent and composable:
+All flags are independent and composable:
 ```
 attack_paths north.sevenkingdoms.local owned \
     --target "Domain Admins" \
     --exclude-edges GenericWrite \
     --timeout 30 \
+    --easy-first \
     --max 5
 ```
 
