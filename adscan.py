@@ -26764,6 +26764,75 @@ class PentestShell:
         target_domain = resolve_repl_domain_or_default(self, target_domain) or ""
         run_identity_inventory(self, target_domain)
 
+    def do_graph_stats(self, args):
+        """Show read-only size/fan-out stats for a domain's attack graph.
+
+        Reads the already-collected attack graph (`domains/<domain>/attack_graph.json`)
+        and reports node/edge counts, the principals with the highest out-degree,
+        and BFS-based reachability-count estimates per hop depth (1-4). Does no
+        path enumeration -- safe to run on any graph size, including ones where
+        `attack_paths` would be expensive. Use it to pick a safe `--depth`/`--target`
+        before running `attack_paths`, especially on large or unfamiliar domains.
+
+        Works against data collected by `enum_domain_auth_phase1` alone (no
+        attack-path discovery required) as well as by `start_auth`.
+
+        Usage:
+            graph_stats <domain> [--from <label>] [--top N]
+
+        Flags:
+            --from <label>: Source node for reachability estimates (default: all
+                owned domain principals).
+            --top N: Number of highest out-degree principals to show (default: 15).
+
+        Examples:
+            graph_stats north.sevenkingdoms.local
+            graph_stats north.sevenkingdoms.local --from jon.snow
+            graph_stats north.sevenkingdoms.local --top 25
+        """
+        from adscan_internal.cli.graph_stats import run_graph_stats
+
+        parts = args.split()
+        has_explicit_domain = bool(parts) and not parts[0].startswith("--")
+        explicit_domain = parts[0] if has_explicit_domain else None
+        domain = resolve_repl_domain_or_default(self, explicit_domain) or ""
+        if not domain:
+            print_instruction(
+                "Usage: graph_stats <domain> [--from <label>] [--top N]"
+            )
+            return
+
+        from_label: str | None = None
+        top_n = 15
+        i = 1 if has_explicit_domain else 0
+        while i < len(parts):
+            token = parts[i]
+            if token == "--from" and i + 1 < len(parts):
+                from_label = parts[i + 1]
+                i += 2
+                continue
+            if token.startswith("--from="):
+                from_label = token.split("=", 1)[1]
+                i += 1
+                continue
+            if token == "--top" and i + 1 < len(parts):
+                try:
+                    top_n = int(parts[i + 1])
+                except ValueError:
+                    pass
+                i += 2
+                continue
+            if token.startswith("--top="):
+                try:
+                    top_n = int(token.split("=", 1)[1])
+                except ValueError:
+                    pass
+                i += 1
+                continue
+            i += 1
+
+        run_graph_stats(self, domain, from_label=from_label, top_n=top_n)
+
     def ask_for_users(self, target_domain):
         """Wrapper for ask_for_users - maintains compatibility."""
         from adscan_internal.cli.attack_graph_reports import ask_for_users

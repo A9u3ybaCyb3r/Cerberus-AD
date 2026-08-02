@@ -92,6 +92,7 @@ _COMMAND_DOMAIN_CONTEXT_POLICIES: dict[str, DomainContextPolicy] = {
     "export": "exempt",
     "generate_report": "exempt",
     "get_flags": "requires_initialized_domain",
+    "graph_stats": "requires_initialized_domain",
     "help": "exempt",
     "info": "exempt",
     "initialize_report": "exempt",
