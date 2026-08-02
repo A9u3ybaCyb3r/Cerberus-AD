@@ -343,6 +343,88 @@ def build_path_priority_key(
     )
 
 
+def _easy_first_actionable_relations(record: dict[str, object]) -> list[str]:
+    """Return the non-context relation names for one path record."""
+    relations_raw = record.get("relations")
+    relations = (
+        [str(r or "").strip() for r in relations_raw]
+        if isinstance(relations_raw, list)
+        else []
+    )
+    return [r for r in relations if r and classify_relation_support(r).kind != "context"]
+
+
+def _easy_first_effort_score(record: dict[str, object]) -> int:
+    """Sum of per-relation compromise-effort weights for one path (lower = easier)."""
+    return sum(
+        COMPROMISE_EFFORT_PRIORITY.get(
+            classify_relation_support(relation).compromise_effort, 4
+        )
+        for relation in _easy_first_actionable_relations(record)
+    )
+
+
+def _easy_first_path_length(record: dict[str, object]) -> int:
+    """Number of executable hops in one path record (shorter = easier)."""
+    raw_length = record.get("length")
+    if isinstance(raw_length, int):
+        return raw_length
+    if isinstance(raw_length, str) and raw_length.strip().isdigit():
+        return int(raw_length.strip())
+    return len(_easy_first_actionable_relations(record))
+
+
+def build_easy_first_priority_key(
+    record: dict[str, object],
+    *,
+    owned_principals: frozenset[str] | None = None,
+) -> tuple[int, int, int, int, str, str]:
+    """Return an opt-in sort key that prioritizes practical, already-actionable paths.
+
+    Ordering: an owned-credential start first (no extra, unmodeled compromise
+    step needed to even begin the path), then the shortest path (fewer hops =
+    fewer things that can go wrong), then the lowest aggregate per-relation
+    effort score, then falls back to the same target-priority-class tiering
+    ``build_path_priority_key`` uses so genuinely critical targets still
+    don't get buried, then a deterministic (source, target) tiebreak.
+
+    Complements (does not replace) the default canonical ordering used by
+    ``order_attack_paths_for_display`` -- opt-in via a CLI flag, since "what
+    counts as easy" is a judgment call some operators want and others don't.
+    Recomputes its inputs independently rather than reusing
+    ``build_path_priority_key``'s internals, so this addition can never
+    change that function's carefully-tuned default behavior.
+    """
+    source_label = str(record.get("source") or "").strip().lower()
+    owned_norm = (
+        {str(p or "").strip().lower() for p in owned_principals}
+        if owned_principals
+        else None
+    )
+    owned_rank = 0 if (owned_norm is not None and source_label in owned_norm) else 1
+
+    target_priority_class = str(
+        record.get("target_priority_class")
+        or (
+            "tierzero"
+            if record.get("is_tier_zero")
+            else "highvalue" if record.get("target_is_high_value") else "pivot"
+        )
+    ).strip().lower()
+    priority_class_order = {"tierzero": 0, "highvalue": 1, "pivot": 2}.get(
+        target_priority_class, 2
+    )
+
+    return (
+        owned_rank,
+        _easy_first_path_length(record),
+        _easy_first_effort_score(record),
+        priority_class_order,
+        str(record.get("source", "")).lower(),
+        str(record.get("target", "")).lower(),
+    )
+
+
 def get_path_target_outcome_class(record: dict[str, object]) -> str:
     """Return the normalized ADscan outcome class for one path.
 

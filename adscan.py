@@ -27091,7 +27091,7 @@ class PentestShell:
         only paths to non-high-value targets (pivot opportunities, lateral movement).
 
         Usage:
-            attack_paths <domain>   [--max N] [--depth N] [--path-steps N] [--all] [--lowpriv] [--keep-longest] [--target NAME] [--timeout N] [--exclude-edges REL1,REL2]
+            attack_paths <domain>   [--max N] [--depth N] [--path-steps N] [--all] [--lowpriv] [--keep-longest] [--target NAME] [--timeout N] [--exclude-edges REL1,REL2] [--easy-first]
 
         Args:
             domain: Target domain (e.g. `north.sevenkingdoms.local`)
@@ -27130,6 +27130,13 @@ class PentestShell:
                 noise-generation tooling, per `graph_stats`) so search budget
                 isn't wasted fanning out through them before reaching paths
                 that actually matter.
+            --easy-first: Re-sort results toward what you can practically go do
+                next instead of the default target-importance ordering: an
+                owned-credential start first, then the shortest path, then the
+                lowest aggregate per-relation effort score. Without this, a
+                long chain to a nominally more "important" target can outrank
+                a one-hop path (e.g. ADCS ESC1) you can execute right now from
+                a credential you already hold.
 
         Examples:
             attack_paths north.sevenkingdoms.local
@@ -27141,6 +27148,7 @@ class PentestShell:
             attack_paths north.sevenkingdoms.local owned --target "Domain Admins"
             attack_paths north.sevenkingdoms.local owned --timeout 60
             attack_paths north.sevenkingdoms.local owned --exclude-edges GenericWrite,AddMember
+            attack_paths north.sevenkingdoms.local owned --easy-first
             attack_paths north.sevenkingdoms.local --path-steps 2
             attack_paths north.sevenkingdoms.local jon.snow
             attack_paths north.sevenkingdoms.local jon.snow 1
@@ -27159,7 +27167,7 @@ class PentestShell:
             print_instruction(
                 "Usage: attack_paths <domain> [user|owned|user1 user2 ...] [index] [--max N] [--depth N] "
                 "[--path-steps N] [--tier0-only] [--all] [--lowpriv] [--no-cache] [--keep-longest] "
-                "[--target NAME] [--timeout N] [--exclude-edges REL1,REL2]"
+                "[--target NAME] [--timeout N] [--exclude-edges REL1,REL2] [--easy-first]"
             )
             return
 
@@ -27210,6 +27218,7 @@ class PentestShell:
         target_name: str | None = None
         timeout_seconds: float | None = None
         excluded_relations: frozenset[str] | None = None
+        easy_first = False
 
         # Parse flags first: --max N, --depth N (and remove them from positional parsing).
         positionals: list[str] = []
@@ -27330,6 +27339,10 @@ class PentestShell:
                 excluded_relations = _parse_exclude_edges(token.split("=", 1)[1])
                 i += 1
                 continue
+            if token in {"--easy-first", "--easy_first"}:
+                easy_first = True
+                i += 1
+                continue
             positionals.append(token)
             i += 1
 
@@ -27377,6 +27390,7 @@ class PentestShell:
             target_name=target_name,
             timeout_seconds=timeout_seconds,
             excluded_relations=excluded_relations,
+            easy_first=easy_first,
         )
 
     def do_attack_steps(self, args):

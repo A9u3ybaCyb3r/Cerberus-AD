@@ -1844,6 +1844,7 @@ def run_show_attack_paths(
     target_name: str | None = None,
     timeout_seconds: float | None = None,
     excluded_relations: frozenset[str] | None = None,
+    easy_first: bool = False,
 ) -> None:
     """Show attack paths and optionally a detailed path.
 
@@ -1871,6 +1872,17 @@ def run_show_attack_paths(
     high-fan-out edge types (often lab noise-generation tooling) so search
     budget isn't wasted fanning out through them before reaching paths that
     actually matter.
+
+    ``easy_first`` re-sorts the already-computed results with
+    :func:`adscan_internal.services.attack_step_support_registry.build_easy_first_priority_key`
+    instead of the default canonical UX ordering: an owned-credential start
+    first (no extra, unmodeled compromise step needed to even begin), then
+    the shortest path, then the lowest aggregate per-relation effort score.
+    The default ordering ranks target criticality far above path length/
+    effort, so a long, harder chain to a nominally more "important" target
+    can outrank a one-hop path you can execute right now from a credential
+    you already hold -- this flag is for "what can I actually go do next,"
+    not "what's theoretically most valuable."
     """
     from adscan_internal.services.attack_graph_service import (
         get_attack_paths_cache_stats,
@@ -2291,6 +2303,26 @@ def run_show_attack_paths(
     deadline = time.monotonic() + timeout_seconds if timeout_seconds else None
 
     def _sort_paths(paths: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        if easy_first:
+            # Opt-in re-sort toward practical, already-actionable paths --
+            # see run_show_attack_paths's docstring and
+            # build_easy_first_priority_key for why this differs from the
+            # canonical ordering below.
+            from adscan_internal.services.attack_step_support_registry import (
+                build_easy_first_priority_key,
+            )
+
+            owned = frozenset(
+                str(u or "").strip().lower()
+                for u in get_owned_domain_usernames_for_attack_paths(
+                    shell, target_domain
+                )
+            )
+            return sorted(
+                paths,
+                key=lambda p: build_easy_first_priority_key(p, owned_principals=owned),
+            )
+
         # Canonical UX ordering — same single source of truth used by the
         # table renderer and any selector prompt downstream. The canonical
         # key already groups by priority class (Tier 0 → high-value → pivot)
