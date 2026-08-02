@@ -26778,17 +26778,25 @@ class PentestShell:
         attack-path discovery required) as well as by `start_auth`.
 
         Usage:
-            graph_stats <domain> [--from <label>] [--top N]
+            graph_stats <domain> [--from <label>] [--top N] [--list-ous]
 
         Flags:
             --from <label>: Source node for reachability estimates (default: all
                 owned domain principals).
             --top N: Number of highest out-degree principals to show (default: 15).
+            --list-ous: List true OUs (kind=OU, not BloodHound's generic Container
+                objects) instead of the normal stats, sorted by *enabled*
+                descendant object count. Real domains keep old/decommissioned OUs
+                around full of disabled accounts for process reasons -- sorting by
+                what's actually enabled right now (not raw object count) surfaces
+                the OU the company is actively using, not just whichever one
+                happens to have the most stale leftovers.
 
         Examples:
             graph_stats north.sevenkingdoms.local
             graph_stats north.sevenkingdoms.local --from jon.snow
             graph_stats north.sevenkingdoms.local --top 25
+            graph_stats north.sevenkingdoms.local --list-ous
         """
         from adscan_internal.cli.graph_stats import run_graph_stats
 
@@ -26798,12 +26806,13 @@ class PentestShell:
         domain = resolve_repl_domain_or_default(self, explicit_domain) or ""
         if not domain:
             print_instruction(
-                "Usage: graph_stats <domain> [--from <label>] [--top N]"
+                "Usage: graph_stats <domain> [--from <label>] [--top N] [--list-ous]"
             )
             return
 
         from_label: str | None = None
         top_n = 15
+        list_ous = False
         i = 1 if has_explicit_domain else 0
         while i < len(parts):
             token = parts[i]
@@ -26829,9 +26838,15 @@ class PentestShell:
                     pass
                 i += 1
                 continue
+            if token in {"--list-ous", "--list_ous"}:
+                list_ous = True
+                i += 1
+                continue
             i += 1
 
-        run_graph_stats(self, domain, from_label=from_label, top_n=top_n)
+        run_graph_stats(
+            self, domain, from_label=from_label, top_n=top_n, list_ous=list_ous
+        )
 
     def ask_for_users(self, target_domain):
         """Wrapper for ask_for_users - maintains compatibility."""

@@ -23,6 +23,7 @@ from adscan_internal.services.graph_stats_service import (
     DEFAULT_TOP_N,
     GraphStats,
     compute_graph_stats,
+    list_organizational_units,
 )
 
 
@@ -32,6 +33,7 @@ def run_graph_stats(
     *,
     from_label: str | None = None,
     top_n: int = DEFAULT_TOP_N,
+    list_ous: bool = False,
 ) -> None:
     graph = load_attack_graph(shell, target_domain)
     nodes_map = graph.get("nodes") if isinstance(graph.get("nodes"), dict) else {}
@@ -42,6 +44,10 @@ def run_graph_stats(
             "`enum_domain_auth_phase1 <domain>` (collection only, no attack-path "
             "discovery) or `start_auth <domain>` first."
         )
+        return
+
+    if list_ous:
+        _print_ou_list(target_domain, list_organizational_units(graph))
         return
 
     source_ids: set[str] = set()
@@ -113,3 +119,42 @@ def _print_graph_stats(domain: str, stats: GraphStats) -> None:
     print_info("Danger estimate:")
     for note in stats.danger_notes:
         print_warning(f"  {note}")
+
+
+def _print_ou_list(domain: str, ous: list) -> None:
+    from rich.table import Table
+
+    marked_domain = mark_sensitive(domain, "domain")
+    console = _get_console()
+
+    if not ous:
+        print_warning(
+            f"No organizational units (kind=OU) found for {marked_domain}. "
+            "Note this only counts true LDAP OUs, not the generic Container "
+            "objects BloodHound also collects (system/administrative "
+            "containers, not real org structure)."
+        )
+        return
+
+    print_info(
+        f"{len(ous)} organizational unit(s) found for {marked_domain}, sorted "
+        "by enabled descendant object count -- an OU with a large gap "
+        "between 'Total objects' and 'Enabled' is likely legacy/decommissioned "
+        "structure kept around for process reasons, not where the company "
+        "actually operates."
+    )
+    table = Table()
+    table.add_column("OU")
+    table.add_column("Depth", justify="right")
+    table.add_column("Enabled", justify="right")
+    table.add_column("Total objects", justify="right")
+    table.add_column("Distinguished name")
+    for ou in ous:
+        table.add_row(
+            mark_sensitive(ou.label, "domain"),
+            str(ou.depth),
+            str(ou.descendant_enabled_object_count),
+            str(ou.descendant_object_count),
+            mark_sensitive(ou.distinguished_name, "domain"),
+        )
+    console.print(table)

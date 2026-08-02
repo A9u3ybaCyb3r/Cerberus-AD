@@ -27,6 +27,7 @@ top of the fix:
 | Addition | What it does |
 |---|---|
 | `graph_stats <domain>` | Read-only sizing of the attack graph — no path search |
+| `graph_stats ... --list-ous` | List real OUs sorted by *active* usage, cutting through legacy-OU noise |
 | `attack_paths ... --target <name>` | Shortest path(s) to one specific node |
 | `attack_paths ... --timeout <seconds>` | Wall-clock budget with partial results |
 | `attack_paths ... --exclude-edges <rel1,rel2>` | Drop noisy edge types from traversal |
@@ -98,6 +99,48 @@ Danger estimate:
 That's the signal to reach for `--exclude-edges GenericWrite` or a smaller
 `--depth` before running the full search, instead of finding out the hard
 way.
+
+## `graph_stats <domain> --list-ous`
+
+Lists the domain's true OUs (`kind: "OU"` — not BloodHound's generic
+`Container` objects, which also cover purely administrative/system LDAP
+containers and would just be noise here), sorted by *enabled* descendant
+object count rather than raw count. Real domains routinely keep
+old/decommissioned OUs around — a former department, a site that got shut
+down — full of disabled accounts nobody deleted for process or political
+reasons. Sorting by what's actually enabled right now, not by however many
+stale objects happen to still be sitting there, surfaces the OU the company
+is actually operating out of.
+
+```
+graph_stats north.sevenkingdoms.local --list-ous
+```
+
+Sample output shape:
+```
+3 organizational unit(s) found for north.sevenkingdoms.local, sorted by
+enabled descendant object count -- an OU with a large gap between 'Total
+objects' and 'Enabled' is likely legacy/decommissioned structure kept
+around for process reasons, not where the company actually operates.
+
+┌──────────────┬───────┬─────────┬───────────────┬──────────────────────────────────┐
+│ OU            │ Depth │ Enabled │ Total objects │ Distinguished name                │
+├──────────────┼───────┼─────────┼───────────────┼──────────────────────────────────┤
+│ Winterfell     │     1 │     412 │            418 │ OU=Winterfell,DC=north,...        │
+│ OldCastleBlack │     1 │       3 │            187 │ OU=OldCastleBlack,DC=north,...    │
+│ Domain Contr…  │     1 │       2 │              2 │ OU=Domain Controllers,DC=north,...│
+└──────────────┴───────┴─────────┴───────────────┴──────────────────────────────────┘
+```
+
+Here `Winterfell` (412 enabled of 418 total) is obviously the real,
+actively-used OU; `OldCastleBlack` (3 enabled of 187 total) is exactly the
+legacy-cruft case this sorting is meant to catch — high total object count,
+almost entirely stale.
+
+The `Depth` column counts nested `OU=` components in the DN (2 for
+`OU=Sales,OU=Corp,DC=...`), a rough signal for how deep in the tree an OU
+sits. `--list-ous` replaces the normal stats output for that invocation —
+it doesn't combine with `--from`/`--top`.
 
 ## `attack_paths <domain> [owned|user|user1 user2...] --target <name>`
 

@@ -48,6 +48,16 @@ class GraphStats:
     danger_notes: list[str]
 
 
+@dataclass
+class OrganizationalUnit:
+    node_id: str
+    label: str
+    distinguished_name: str
+    depth: int
+    descendant_object_count: int
+    descendant_enabled_object_count: int
+
+
 def _label(nodes_map: dict[str, Any], node_id: str) -> str:
     node = nodes_map.get(node_id)
     if isinstance(node, dict):
@@ -183,6 +193,90 @@ def _build_danger_notes(
             "these sources -- attack_paths should be safe to run at the default depth."
         )
     return notes
+
+
+def list_organizational_units(graph: dict[str, Any]) -> list[OrganizationalUnit]:
+    """Return every true OU in the graph, with how many other objects fall
+    under its subtree -- the practical "which OU actually matters" signal.
+
+    BloodHound collects every LDAP container object (including purely
+    administrative/system ones like ``CN=Operations,CN=DomainUpdates,...``)
+    as ``kind: "Container"``; only ``kind: "OU"`` nodes are true LDAP
+    organizationalUnit objects, so filtering on that distinguishes real org
+    structure from collection noise.
+
+    Raw descendant count alone can still mislead: real domains routinely
+    keep old/abandoned OUs around (a former department, a decommissioned
+    site) full of disabled or otherwise stale accounts nobody deletes for
+    process/political reasons, which can outnumber the objects in the OU
+    that's actually in active use. ``descendant_enabled_object_count`` (only
+    users/computers with ``properties.enabled`` true) is the sort key
+    instead -- it's the count of what's actually live right now, not what
+    happens to still be sitting there. Both counts are returned so the gap
+    between them (e.g. 500 total vs. 12 enabled) is itself a visible signal
+    of "this OU is legacy cruft, not where the company actually is."
+
+    O(V^2) worst case (each OU scanned against every DN) -- fine at graph
+    scale (thousands of nodes, not millions) and still far cheaper than any
+    path enumeration.
+    """
+    nodes_map = graph.get("nodes") if isinstance(graph.get("nodes"), dict) else {}
+    if not isinstance(nodes_map, dict):
+        return []
+
+    ou_candidates: list[tuple[str, dict[str, Any], str]] = []
+    all_dns: list[tuple[str, bool]] = []  # (dn, is_enabled_or_unknown_kind)
+    for node_id, node in nodes_map.items():
+        if not isinstance(node, dict):
+            continue
+        props = (
+            node.get("properties") if isinstance(node.get("properties"), dict) else {}
+        )
+        dn = str(props.get("distinguishedname") or "").strip()
+        if dn:
+            kind = str(node.get("kind") or "").strip().lower()
+            if kind in {"user", "computer"}:
+                enabled = bool(props.get("enabled"))
+            else:
+                # Groups/GPOs/OUs/etc. have no enabled/disabled concept --
+                # count them toward "descendant objects" but not toward the
+                # enabled-only signal, which is specifically about stale
+                # accounts.
+                enabled = False
+            all_dns.append((dn, enabled))
+        if str(node.get("kind") or "").strip().lower() == "ou":
+            ou_candidates.append((node_id, node, dn))
+
+    results: list[OrganizationalUnit] = []
+    for node_id, node, dn in ou_candidates:
+        if not dn:
+            continue
+        dn_lower = dn.lower()
+        descendant_count = 0
+        descendant_enabled_count = 0
+        for other_dn, enabled in all_dns:
+            other_dn_lower = other_dn.lower()
+            if other_dn_lower == dn_lower or not other_dn_lower.endswith(
+                "," + dn_lower
+            ):
+                continue
+            descendant_count += 1
+            if enabled:
+                descendant_enabled_count += 1
+        depth = sum(1 for part in dn.split(",") if part.strip().upper().startswith("OU="))
+        results.append(
+            OrganizationalUnit(
+                node_id=node_id,
+                label=str(node.get("label") or node_id),
+                distinguished_name=dn,
+                depth=depth,
+                descendant_object_count=descendant_count,
+                descendant_enabled_object_count=descendant_enabled_count,
+            )
+        )
+
+    results.sort(key=lambda ou: ou.descendant_enabled_object_count, reverse=True)
+    return results
 
 
 def compute_graph_stats(
