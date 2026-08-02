@@ -322,6 +322,15 @@ _ATTACK_PATHS_CACHE_MAX_ENTRIES = _env_int("ADSCAN_ATTACK_PATHS_CACHE_MAX_ENTRIE
 _ATTACK_PATHS_CACHE_MAX_RECORDS = _env_int(
     "ADSCAN_ATTACK_PATHS_CACHE_MAX_RECORDS", 2000
 )
+# Entry count and per-entry record count are bounded independently above, but
+# not their product -- a large domain with many owned principals produces
+# many distinct cache keys (one per principals-tuple/depth/target/scope
+# combination), so entry count alone doesn't bound total memory when every
+# entry sits near its own per-entry cap. This third budget bounds the sum of
+# record counts across all entries.
+_ATTACK_PATHS_CACHE_MAX_TOTAL_RECORDS = _env_int(
+    "ADSCAN_ATTACK_PATHS_CACHE_MAX_TOTAL_RECORDS", 20000
+)
 _ATTACK_PATH_ENABLE_SYNTHETIC_PRINCIPAL_BATCH = os.getenv(
     "ADSCAN_ATTACK_PATH_ENABLE_SYNTHETIC_PRINCIPAL_BATCH", "0"
 ).strip().lower() in {"1", "true", "yes", "on"}
@@ -2034,7 +2043,33 @@ def _attack_paths_cache_get(
         f"[attack_paths] cache hit: domain={mark_sensitive(domain, 'domain')} "
         f"scope={scope} records={len(cached)}"
     )
+    # Deep-copied on every read, not just on write: cached records get
+    # mutated in place downstream (e.g. _record_exact_signature stamps
+    # "_exact_signature" directly onto the dict), and this cache is shared
+    # across calls/sessions -- a shallow return previously caused a stale-
+    # snapshot bug where a fully-compromised domain was under-reported to
+    # the paid backend (see rematerialize_attack_path_snapshot's docstring).
+    # Do not remove this copy for a memory-perf win without re-auditing that.
     return copy.deepcopy(cached)
+
+
+def _attack_paths_cache_should_evict(
+    entry_count: int,
+    total_records: int,
+    *,
+    max_entries: int,
+    max_total_records: int,
+) -> bool:
+    """Return True if the LRU attack-path cache should evict its oldest entry.
+
+    Two independent budgets: entry COUNT and total RECORD count summed
+    across all entries. A large domain with many distinct owned principals
+    produces many distinct cache keys (one per principals-tuple/depth/target/
+    scope combination); entry count alone doesn't bound memory when every
+    entry sits near its own per-entry record cap -- total record count is
+    the actual memory-proportional signal for that growth axis.
+    """
+    return entry_count > max_entries or total_records > max_total_records
 
 
 def _attack_paths_cache_put(
@@ -2054,11 +2089,18 @@ def _attack_paths_cache_put(
             f"scope={scope} records={len(records)} reason=too_many"
         )
         return
+    # See _attack_paths_cache_get's comment: this copy is load-bearing, not
+    # incidental overhead -- downstream code mutates record dicts in place.
     _ATTACK_PATHS_COMPUTE_CACHE[key] = copy.deepcopy(records)
     _cache_stats_inc(domain, "stores")
     _ATTACK_PATHS_COMPUTE_CACHE.move_to_end(key)
     evicted = 0
-    while len(_ATTACK_PATHS_COMPUTE_CACHE) > _ATTACK_PATHS_CACHE_MAX_ENTRIES:
+    while _attack_paths_cache_should_evict(
+        len(_ATTACK_PATHS_COMPUTE_CACHE),
+        sum(len(v) for v in _ATTACK_PATHS_COMPUTE_CACHE.values()),
+        max_entries=_ATTACK_PATHS_CACHE_MAX_ENTRIES,
+        max_total_records=_ATTACK_PATHS_CACHE_MAX_TOTAL_RECORDS,
+    ):
         _ATTACK_PATHS_COMPUTE_CACHE.popitem(last=False)
         evicted += 1
     if evicted:
