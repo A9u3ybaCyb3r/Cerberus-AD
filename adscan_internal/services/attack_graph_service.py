@@ -48,8 +48,10 @@ from adscan_internal.services.attack_paths_materialized_cache import (
     MaterializedPreparedRuntimeGraph,
     build_attack_path_artifact_fingerprint,
     invalidate_attack_path_artifacts,
+    load_disk_cached_attack_path_results,
     load_materialized_attack_path_artifacts,
     load_materialized_prepared_runtime_graph,
+    persist_attack_path_results_to_disk,
     persist_materialized_attack_path_artifacts,
     persist_materialized_prepared_runtime_graph,
 )
@@ -330,6 +332,22 @@ _ATTACK_PATHS_CACHE_MAX_RECORDS = _env_int(
 # record counts across all entries.
 _ATTACK_PATHS_CACHE_MAX_TOTAL_RECORDS = _env_int(
     "ADSCAN_ATTACK_PATHS_CACHE_MAX_TOTAL_RECORDS", 20000
+)
+# Disk-backed L2 cache, complementing the in-memory L1 cache above: a fresh
+# `cerberus-ad execute attack_paths ...` invocation starts a new process with
+# an empty in-memory cache every time, so repeated calls against an unchanged
+# workspace previously always recomputed from scratch. Persisting results
+# under the workspace (keyed by the same graph/snapshot-mtime-bound cache key
+# the memory cache uses, so it invalidates identically) makes them reusable
+# across process restarts. Unlike the memory cache, this has no per-entry
+# record-count skip -- disk is cheap, and large result sets are exactly the
+# case where recomputation is most worth avoiding; total disk usage is bounded
+# by file-count LRU pruning instead.
+_ATTACK_PATHS_DISK_CACHE_ENABLED = os.getenv(
+    "ADSCAN_ATTACK_PATHS_DISK_CACHE_ENABLED", "1"
+).strip().lower() in {"1", "true", "yes", "on"}
+_ATTACK_PATHS_DISK_CACHE_MAX_FILES = _env_int(
+    "ADSCAN_ATTACK_PATHS_DISK_CACHE_MAX_FILES", 200
 )
 _ATTACK_PATH_ENABLE_SYNTHETIC_PRINCIPAL_BATCH = os.getenv(
     "ADSCAN_ATTACK_PATH_ENABLE_SYNTHETIC_PRINCIPAL_BATCH", "0"
@@ -2026,33 +2044,6 @@ def attack_paths_epoch_fingerprint(shell: object, domain: str) -> tuple[Any, ...
     return (_file_mtime_token(graph_path), _file_mtime_token(snapshot_path))
 
 
-def _attack_paths_cache_get(
-    key: tuple[Any, ...], *, domain: str, scope: str, no_cache: bool = False
-) -> list[dict[str, Any]] | None:
-    """Return cached attack-path records when available."""
-    if no_cache or not _ATTACK_PATHS_CACHE_ENABLED:
-        return None
-    cached = _ATTACK_PATHS_COMPUTE_CACHE.get(key)
-    if cached is None:
-        _cache_stats_inc(domain, "misses")
-        return None
-    _cache_stats_inc(domain, "hits")
-    # LRU touch.
-    _ATTACK_PATHS_COMPUTE_CACHE.move_to_end(key)
-    print_info_debug(
-        f"[attack_paths] cache hit: domain={mark_sensitive(domain, 'domain')} "
-        f"scope={scope} records={len(cached)}"
-    )
-    # Deep-copied on every read, not just on write: cached records get
-    # mutated in place downstream (e.g. _record_exact_signature stamps
-    # "_exact_signature" directly onto the dict), and this cache is shared
-    # across calls/sessions -- a shallow return previously caused a stale-
-    # snapshot bug where a fully-compromised domain was under-reported to
-    # the paid backend (see rematerialize_attack_path_snapshot's docstring).
-    # Do not remove this copy for a memory-perf win without re-auditing that.
-    return copy.deepcopy(cached)
-
-
 def _attack_paths_cache_should_evict(
     entry_count: int,
     total_records: int,
@@ -2072,16 +2063,111 @@ def _attack_paths_cache_should_evict(
     return entry_count > max_entries or total_records > max_total_records
 
 
+def _apply_memory_cache_eviction(domain: str) -> int:
+    """Evict oldest in-memory cache entries until both budgets are satisfied.
+
+    Shared by cache-put and by cache-get's disk-hit promotion path so both
+    can't independently drift out of sync on the eviction rule.
+    """
+    evicted = 0
+    while _attack_paths_cache_should_evict(
+        len(_ATTACK_PATHS_COMPUTE_CACHE),
+        sum(len(v) for v in _ATTACK_PATHS_COMPUTE_CACHE.values()),
+        max_entries=_ATTACK_PATHS_CACHE_MAX_ENTRIES,
+        max_total_records=_ATTACK_PATHS_CACHE_MAX_TOTAL_RECORDS,
+    ):
+        _ATTACK_PATHS_COMPUTE_CACHE.popitem(last=False)
+        evicted += 1
+    if evicted:
+        _cache_stats_inc(domain, "evictions", by=evicted)
+    return evicted
+
+
+def _attack_paths_cache_get(
+    key: tuple[Any, ...],
+    *,
+    domain: str,
+    scope: str,
+    no_cache: bool = False,
+    shell: object | None = None,
+) -> list[dict[str, Any]] | None:
+    """Return cached attack-path records when available.
+
+    Checks the in-memory L1 cache first, then -- when *shell* is given -- the
+    disk-backed L2 cache under the workspace (see
+    ``attack_paths_materialized_cache.persist_attack_path_results_to_disk``),
+    since a fresh process (e.g. a separate ``cerberus-ad execute`` call) has
+    an empty L1 cache but may still have a valid L2 entry from an earlier run.
+    """
+    if no_cache or not _ATTACK_PATHS_CACHE_ENABLED:
+        return None
+    cached = _ATTACK_PATHS_COMPUTE_CACHE.get(key)
+    if cached is not None:
+        _cache_stats_inc(domain, "hits")
+        # LRU touch.
+        _ATTACK_PATHS_COMPUTE_CACHE.move_to_end(key)
+        print_info_debug(
+            f"[attack_paths] cache hit: domain={mark_sensitive(domain, 'domain')} "
+            f"scope={scope} records={len(cached)}"
+        )
+        # Deep-copied on every read, not just on write: cached records get
+        # mutated in place downstream (e.g. _record_exact_signature stamps
+        # "_exact_signature" directly onto the dict), and this cache is
+        # shared across calls/sessions -- a shallow return previously caused
+        # a stale-snapshot bug where a fully-compromised domain was
+        # under-reported to the paid backend (see
+        # rematerialize_attack_path_snapshot's docstring). Do not remove this
+        # copy for a memory-perf win without re-auditing that.
+        return copy.deepcopy(cached)
+
+    if shell is not None and _ATTACK_PATHS_DISK_CACHE_ENABLED:
+        disk_records = load_disk_cached_attack_path_results(
+            shell=shell, domain=domain, cache_key=key
+        )
+        if disk_records is not None:
+            _cache_stats_inc(domain, "hits_disk")
+            print_info_debug(
+                f"[attack_paths] cache hit (disk): domain={mark_sensitive(domain, 'domain')} "
+                f"scope={scope} records={len(disk_records)}"
+            )
+            # Promote into L1 too, subject to the same per-entry skip and
+            # eviction budgets a normal put would apply -- a large disk hit
+            # must not bypass the memory bounds Bug C's fix established.
+            if len(disk_records) <= _ATTACK_PATHS_CACHE_MAX_RECORDS:
+                _ATTACK_PATHS_COMPUTE_CACHE[key] = copy.deepcopy(disk_records)
+                _ATTACK_PATHS_COMPUTE_CACHE.move_to_end(key)
+                _apply_memory_cache_eviction(domain)
+            return copy.deepcopy(disk_records)
+
+    _cache_stats_inc(domain, "misses")
+    return None
+
+
 def _attack_paths_cache_put(
     key: tuple[Any, ...],
     records: list[dict[str, Any]],
     *,
     domain: str,
     scope: str,
+    shell: object | None = None,
 ) -> None:
-    """Store attack-path records in bounded LRU cache."""
+    """Store attack-path records in the bounded in-memory LRU cache, and --
+    when *shell* is given -- persist them to the disk-backed L2 cache too.
+
+    The disk write has no per-entry record-count skip (unlike the in-memory
+    cache below): disk is cheap, and large result sets are exactly the case
+    where avoiding recomputation across process restarts matters most.
+    """
     if not _ATTACK_PATHS_CACHE_ENABLED:
         return
+    if shell is not None and _ATTACK_PATHS_DISK_CACHE_ENABLED:
+        persist_attack_path_results_to_disk(
+            shell=shell,
+            domain=domain,
+            cache_key=key,
+            records=records,
+            max_files=_ATTACK_PATHS_DISK_CACHE_MAX_FILES,
+        )
     if len(records) > _ATTACK_PATHS_CACHE_MAX_RECORDS:
         _cache_stats_inc(domain, "skips")
         print_info_debug(
@@ -2094,17 +2180,7 @@ def _attack_paths_cache_put(
     _ATTACK_PATHS_COMPUTE_CACHE[key] = copy.deepcopy(records)
     _cache_stats_inc(domain, "stores")
     _ATTACK_PATHS_COMPUTE_CACHE.move_to_end(key)
-    evicted = 0
-    while _attack_paths_cache_should_evict(
-        len(_ATTACK_PATHS_COMPUTE_CACHE),
-        sum(len(v) for v in _ATTACK_PATHS_COMPUTE_CACHE.values()),
-        max_entries=_ATTACK_PATHS_CACHE_MAX_ENTRIES,
-        max_total_records=_ATTACK_PATHS_CACHE_MAX_TOTAL_RECORDS,
-    ):
-        _ATTACK_PATHS_COMPUTE_CACHE.popitem(last=False)
-        evicted += 1
-    if evicted:
-        _cache_stats_inc(domain, "evictions", by=evicted)
+    _apply_memory_cache_eviction(domain)
     print_info_debug(
         f"[attack_paths] cache store: domain={mark_sensitive(domain, 'domain')} "
         f"scope={scope} records={len(records)} entries={len(_ATTACK_PATHS_COMPUTE_CACHE)}"
@@ -13744,10 +13820,11 @@ def compute_display_paths_for_user(
             target,
             str(target_mode or "object").strip().lower(),
             bool(ATTACK_PATH_EXPAND_TERMINAL_MEMBERSHIPS),
+            tuple(sorted(excluded_relations)) if excluded_relations else (),
         ),
     )
     cached = _attack_paths_cache_get(
-        cache_key, domain=domain, scope="user", no_cache=_cache_bypass
+        cache_key, domain=domain, scope="user", no_cache=_cache_bypass, shell=shell
     )
     if cached is not None:
         cached = _filter_zero_length_display_paths(cached, domain=domain, scope="user")
@@ -13900,7 +13977,9 @@ def compute_display_paths_for_user(
         target_mode=target_mode,
     )
     if not _cache_bypass:
-        _attack_paths_cache_put(cache_key, records, domain=domain, scope="user")
+        _attack_paths_cache_put(
+            cache_key, records, domain=domain, scope="user", shell=shell
+        )
     return records
 
 
@@ -13953,10 +14032,11 @@ def compute_display_paths_for_domain(
             # holistic longest), so it MUST be part of the cache key — otherwise
             # alternating modes in one process returns stale results.
             bool(keep_longest),
+            tuple(sorted(excluded_relations)) if excluded_relations else (),
         ),
     )
     cached = _attack_paths_cache_get(
-        cache_key, domain=domain, scope="domain", no_cache=_cache_bypass
+        cache_key, domain=domain, scope="domain", no_cache=_cache_bypass, shell=shell
     )
     if cached is not None:
         cached = _filter_zero_length_display_paths(
@@ -14082,7 +14162,9 @@ def compute_display_paths_for_domain(
         target_mode=target_mode,
     )
     if not _cache_bypass:
-        _attack_paths_cache_put(cache_key, records, domain=domain, scope="domain")
+        _attack_paths_cache_put(
+            cache_key, records, domain=domain, scope="domain", shell=shell
+        )
     return records
 
 
@@ -15332,10 +15414,15 @@ def compute_display_paths_for_principals(
             target,
             int(membership_sample_max),
             str(target_mode or "object").strip().lower(),
+            tuple(sorted(excluded_relations)) if excluded_relations else (),
         ),
     )
     cached = _attack_paths_cache_get(
-        cache_key, domain=domain, scope="principals", no_cache=_cache_bypass
+        cache_key,
+        domain=domain,
+        scope="principals",
+        no_cache=_cache_bypass,
+        shell=shell,
     )
     if cached is not None:
         cached = _filter_zero_length_display_paths(
@@ -15520,7 +15607,9 @@ def compute_display_paths_for_principals(
         target_mode=target_mode,
     )
     if not _cache_bypass:
-        _attack_paths_cache_put(cache_key, records, domain=domain, scope="principals")
+        _attack_paths_cache_put(
+            cache_key, records, domain=domain, scope="principals", shell=shell
+        )
     return records
 
 

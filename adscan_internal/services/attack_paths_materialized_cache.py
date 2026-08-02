@@ -35,6 +35,100 @@ class MaterializedPreparedRuntimeGraph:
     storage_format: str
 
 
+def _json_safe_for_hash(value: object) -> object:
+    """Convert a cache-key value into a JSON-serializable, order-stable form."""
+    if isinstance(value, (tuple, list)):
+        return [_json_safe_for_hash(v) for v in value]
+    if isinstance(value, (frozenset, set)):
+        return sorted(_json_safe_for_hash(v) for v in value)
+    return value
+
+
+def attack_path_results_key_hash(cache_key: tuple) -> str:
+    """Stable content-addressed filename for a computed attack-path result set.
+
+    Reuses the in-memory cache key, which already binds to (domain, scope,
+    graph_mtime, snapshot_mtime, query params) -- so a disk entry stops
+    matching (a correct, if lazy, invalidation) the moment the graph or
+    snapshot changes on disk, exactly like the in-memory cache. Stale files
+    are simply never looked up again; pruning bounds how many accumulate.
+    """
+    import hashlib
+
+    raw = json.dumps(
+        _json_safe_for_hash(cache_key), sort_keys=True, separators=(",", ":")
+    )
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
+
+
+def attack_path_results_cache_dir(shell: object, domain: str) -> Path:
+    """Return the per-domain directory for persisted computed path results."""
+    return attack_path_cache_dir(shell, domain) / "results"
+
+
+def load_disk_cached_attack_path_results(
+    *, shell: object, domain: str, cache_key: tuple
+) -> list[dict] | None:
+    """Load a previously persisted attack-path result set for *cache_key*."""
+    path = (
+        attack_path_results_cache_dir(shell, domain)
+        / f"{attack_path_results_key_hash(cache_key)}.json"
+    )
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return None
+    records = payload.get("records") if isinstance(payload, dict) else None
+    return records if isinstance(records, list) else None
+
+
+def _prune_attack_path_results_cache(cache_dir: Path, *, max_files: int) -> None:
+    """Evict oldest-by-mtime result files once *cache_dir* exceeds *max_files*."""
+    try:
+        files = sorted(cache_dir.glob("*.json"), key=lambda p: p.stat().st_mtime)
+    except OSError:
+        return
+    excess = len(files) - max_files
+    if excess <= 0:
+        return
+    for stale in files[:excess]:
+        try:
+            stale.unlink()
+        except OSError:
+            continue
+
+
+def persist_attack_path_results_to_disk(
+    *,
+    shell: object,
+    domain: str,
+    cache_key: tuple,
+    records: list[dict],
+    max_files: int = 200,
+) -> None:
+    """Persist a computed attack-path result set to disk, LRU-pruned by file count.
+
+    Complements the in-memory LRU cache: a separate `cerberus-ad execute
+    attack_paths ...` invocation starts a fresh process with an empty
+    in-memory cache, so it gets zero benefit from that cache alone. This
+    survives across process restarts, keyed by the same graph/snapshot-mtime
+    -bound cache key so it can never serve a stale result once the
+    underlying graph changes.
+    """
+    cache_dir = attack_path_results_cache_dir(shell, domain)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    key_hash = attack_path_results_key_hash(cache_key)
+    path = cache_dir / f"{key_hash}.json"
+    payload = {"key_hash": key_hash, "domain": domain, "records": records}
+    try:
+        path.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+    except OSError:
+        return
+    _prune_attack_path_results_cache(cache_dir, max_files=max_files)
+
+
 def _file_token(path: str) -> tuple[int | None, int | None]:
     """Return `(mtime_ns, size)` for *path* when available."""
     try:
