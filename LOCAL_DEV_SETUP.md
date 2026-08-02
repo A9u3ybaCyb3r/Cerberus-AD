@@ -81,10 +81,20 @@ rebuild — the editable pipx install already picks those up.
 
 ## Switching between the official tool and this fork
 
-Two independent commands, each with its own pipx venv, Docker image, and
-`ADSCAN_HOME`/state directory (keyed off the binary name):
+Two independent commands, each with its own pipx venv and Docker image:
 - `adscan` — official, if installed via `pipx install adscan`.
 - `cerberus-ad` — this repo, editable install.
+
+State directory isolation is **not** automatic in upstream ADscan —
+`adscan_core.path_utils.get_adscan_home()` hardcodes `~/.adscan` (only
+overridable via the `ADSCAN_HOME` env var) with no awareness of which
+console-script name invoked it. Without a fix, `adscan` and `cerberus-ad`
+would read/write the exact same `~/.adscan/workspaces/...` — the opposite of
+"use both without confusion." This fork adds
+`_default_adscan_home_for_fork_entrypoint()` in `adscan_launcher/cli.py`:
+when invoked as `cerberus-ad` (checked via `sys.argv[0]`) and `ADSCAN_HOME`
+isn't already set, it defaults to `~/.cerberus-ad` before any command runs.
+An explicit `ADSCAN_HOME` in your environment always overrides this.
 
 Running one never affects the other's install, image, or workspace data.
 

@@ -194,6 +194,25 @@ def _cleanup_legacy_sudo_alias() -> None:
         _remove_legacy_adscan_sudo_alias(rcfile)
 
 
+def _default_adscan_home_for_fork_entrypoint() -> None:
+    """Default ADSCAN_HOME to ``~/.cerberus-ad`` when run as the ``cerberus-ad``
+    entrypoint, so this fork never shares workspace/state data with a
+    separately installed official ``adscan``.
+
+    adscan_core.path_utils.get_adscan_home() falls back to a hardcoded
+    ``~/.adscan`` unless ADSCAN_HOME is set -- it is not aware of which
+    console-script name invoked it. Without this, two commands with
+    different names (adscan vs cerberus-ad) would still read/write the
+    exact same host state directory. Only sets a default; an explicit
+    ADSCAN_HOME in the environment always wins.
+    """
+    if os.getenv("ADSCAN_HOME"):
+        return
+    if os.path.basename(sys.argv[0]) != "cerberus-ad":
+        return
+    os.environ["ADSCAN_HOME"] = os.path.expanduser("~/.cerberus-ad")
+
+
 class _DeliverablesAwareParser(argparse.ArgumentParser):
     """Argparse parser that appends a tiered Deliverables section to --help.
 
@@ -1906,6 +1925,7 @@ def main(argv: list[str] | None = None) -> None:
     global _SESSION_CAPTURE_FINALIZED
     _SESSION_CAPTURE_FINALIZED = False
     _cleanup_legacy_sudo_alias()
+    _default_adscan_home_for_fork_entrypoint()
 
     raw_argv = list(sys.argv[1:] if argv is None else argv)
     parser = _build_parser()
