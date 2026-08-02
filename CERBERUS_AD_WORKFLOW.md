@@ -259,6 +259,16 @@ about a high-fan-out principal (the 100+ out-degree threshold) and know to
 reach for `--exclude-edges` or a smaller `--depth` *before* running the full
 search, instead of finding out from an OOM kill.
 
+On a domain with a deep or messy OU tree — real companies routinely leave
+old/decommissioned OUs in place, full of disabled leftover accounts —
+`graph_stats <domain> --list-ous` lists the true OUs (not BloodHound's
+generic Container noise) sorted by *actively enabled* object count, not raw
+count, so a legacy graveyard OU doesn't outrank the one the company is
+actually using:
+```
+graph_stats simply.cyber --list-ous
+```
+
 ### Step 3 — Run attack-path discovery
 
 ```
