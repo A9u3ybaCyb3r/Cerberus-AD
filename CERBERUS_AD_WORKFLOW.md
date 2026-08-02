@@ -110,6 +110,46 @@ cerberus-ad check   # should report "Docker-mode execution probe succeeded."
 
 ---
 
+## 1.5 Quick start — the two ways to run it
+
+Once install is confirmed, there are exactly two ways to actually use the
+tool. Pick whichever matches what you're doing right now; both are covered
+in full depth later (Parts 3 and 4).
+
+**Option 1 — One shot, fully automated.** Good for "just compromise this
+domain and show me everything," no manual steps in between:
+
+```bash
+export ADSCAN_HOME=~/.cerberus-ad
+cerberus-ad ci auth --type ctf --interface eth0 \
+    --domain simply.cyber --dc-ip 192.168.19.155 \
+    -u alice.wonderland -p 'P@ssw0rd!' \
+    -w SimplyCyber --keep-workspace
+```
+
+**Option 2 — Interactive shell.** Good for working a domain step by step,
+inspecting results between phases, or running any of the ~140 commands in
+Part 5 individually:
+
+```bash
+cerberus-ad start
+```
+
+then inside the shell:
+
+```
+start_auth simply.cyber --dc-ip 192.168.19.155 -u alice.wonderland -p 'P@ssw0rd!'
+graph_stats simply.cyber
+attack_paths simply.cyber owned
+attack_paths simply.cyber owned --easy-first
+```
+
+Both were verified live against `simply.cyber` on this machine
+(`Domain compromised ✓`, `11 attack paths identified`, `23 credentials
+currently stored in workspace`).
+
+---
+
 ## 2. The launcher commands (run on your host, not inside a domain session)
 
 These are `cerberus-ad <command>`, not something you type inside the
