@@ -85,8 +85,16 @@ from adscan_internal.workspaces import domain_relpath, domain_subpath, write_jso
 
 
 # Compute-time path cap for `attack_paths` UX.
-# Set to `None` (default) for unlimited path computation, or to a positive int.
-ATTACK_PATHS_COMPUTE_DEFAULT_MAX: int | None = None
+# Fallback used only when `max_display` itself isn't a usable positive int
+# (see `_resolve_attack_paths_compute_cap`). Set to `None` here would make
+# path computation unbounded by default — that used to be the case and is
+# the root cause of `attack_paths ... owned` OOM-killing on non-trivial
+# graphs: DFS emits paths in traversal order, not shortest-first, so
+# without ANY compute-time cap, `owned` mode ran one fully unbounded DFS
+# per owned principal with nothing to stop it short of the kernel OOM
+# killer. Keep this finite; use ADSCAN_ATTACK_PATHS_COMPUTE_MAX=0 (or a
+# negative value) to explicitly opt back into unlimited computation.
+ATTACK_PATHS_COMPUTE_DEFAULT_MAX: int | None = 2000
 
 
 def _get_attack_paths_step_sample_limit() -> int:
@@ -675,11 +683,24 @@ def _sanitize_acl_paths_for_attack_graph(
     return kept_paths, report
 
 
+# Headroom multiplier applied to `--max`/`max_display` to get the compute-time
+# cap. The DFS engine emits paths in traversal order, not shortest-first, so
+# capping compute at exactly `max_display` risks silently dropping the actual
+# best paths that display-side sorting (`order_attack_paths_for_display`)
+# would otherwise have surfaced. A few thousand extra candidates is still
+# orders of magnitude cheaper than the previous unbounded default.
+_ATTACK_PATHS_COMPUTE_HEADROOM = 25
+_ATTACK_PATHS_COMPUTE_FLOOR = 200
+
+
 def _resolve_attack_paths_compute_cap(max_display: int) -> int | None:
     """Return compute-time cap for attack-path enumeration.
 
-    Default behavior is controlled by `ATTACK_PATHS_COMPUTE_DEFAULT_MAX`.
-    `None` means unlimited (legacy behavior).
+    By default this scales with `max_display` (the `--max` value the operator
+    passed, or its default) with headroom so display-side sorting still has
+    enough candidates to pick the true best paths from. Falls back to
+    `ATTACK_PATHS_COMPUTE_DEFAULT_MAX` when `max_display` isn't a usable
+    positive int.
 
     Env overrides:
         ADSCAN_ATTACK_PATHS_COMPUTE_MAX:
@@ -696,7 +717,9 @@ def _resolve_attack_paths_compute_cap(max_display: int) -> int | None:
         except ValueError:
             pass
 
-    _ = max_display
+    if isinstance(max_display, int) and max_display > 0:
+        return max(max_display * _ATTACK_PATHS_COMPUTE_HEADROOM, _ATTACK_PATHS_COMPUTE_FLOOR)
+
     if ATTACK_PATHS_COMPUTE_DEFAULT_MAX is None:
         return None
     return max(1, int(ATTACK_PATHS_COMPUTE_DEFAULT_MAX))
