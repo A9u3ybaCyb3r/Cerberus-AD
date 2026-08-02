@@ -74,10 +74,16 @@ from adscan_launcher.paths import (
 )
 
 
-DEFAULT_DOCKER_IMAGE = "adscan/adscan-lite:latest"
-DEFAULT_DEV_DOCKER_IMAGE = "adscan/adscan-lite-dev:edge"
-LEGACY_DEFAULT_DOCKER_IMAGE = "adscan/adscan:latest"
-LEGACY_DEFAULT_DEV_DOCKER_IMAGE = "adscan/adscan-dev:edge"
+# Renamed for this personal fork so it never collides with, or silently
+# falls back to, the official ADscan registry images -- this launcher only
+# ever resolves images built locally from this repo (see Dockerfile.runtime's
+# runtime-lite target). LEGACY_* duplicate the primary value rather than
+# pointing at the real "adscan/..." names, since the resolution fallback
+# chain would otherwise still be able to reach the official registry.
+DEFAULT_DOCKER_IMAGE = "cerberus-ad:latest"
+DEFAULT_DEV_DOCKER_IMAGE = "cerberus-ad:dev"
+LEGACY_DEFAULT_DOCKER_IMAGE = "cerberus-ad:latest"
+LEGACY_DEFAULT_DEV_DOCKER_IMAGE = "cerberus-ad:dev"
 ADSCAN_RUNTIME_LICENSE_MODE_ENV = "ADSCAN_RUNTIME_LICENSE_MODE"
 DEFAULT_HOST_HELPER_SOCKET_NAME = "host-helper.sock"
 _DOCKER_RUN_HELP_HAS_GPUS_RE = re.compile(r"\s--gpus\b", re.IGNORECASE)

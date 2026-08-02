@@ -3,9 +3,9 @@ requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "adscan"
+name = "cerberus-ad"
 version = "11.0.0"
-description = "Free Active Directory pentesting CLI for AD enumeration, attack paths, Kerberoasting, AS-REP roasting, ADCS, DCSync, password spraying, and CTF labs."
+description = "Personal fork of ADscan (https://github.com/ADScanPro/adscan) with bounded attack-path discovery. Not the official ADscan distribution."
 readme = "README.md"
 authors = [{ name = "ADscan" }]
 requires-python = ">=3.9"
@@ -142,7 +142,7 @@ issues = "https://github.com/ADscanPro/adscan/issues"
 changelog = "https://github.com/ADscanPro/adscan/releases"
 
 [project.scripts]
-adscan = "adscan_launcher.cli:main"
+cerberus-ad = "adscan_launcher.cli:main"
 
 [tool.uv.sources]
 # Vendored skelsec native AD stack — committed under vendor/ as the single
